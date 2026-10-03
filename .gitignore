@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Compiled C helper
+case-permutation
+*.o
+
+# Generated wordlists / tool output (keep requirements*.txt tracked)
+output.txt
+known_words.txt
+remaining_text.txt
+non_english_words.txt
+letters.txt
+short_letters.txt
+numbers.txt
+specials.txt
+*.pot
+*.wordlist
+
+# OS
+.DS_Store

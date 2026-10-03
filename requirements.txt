@@ -1,0 +1,4 @@
+# Runtime dependency for the two dictionary-manipulation scripts that can look
+# words up in an English corpus. Both also accept --custom-dict, in which case
+# nltk is not needed at all and nothing here has to be installed.
+nltk>=3.8

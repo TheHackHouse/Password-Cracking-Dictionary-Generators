@@ -1,121 +1,220 @@
-import itertools
-import sys
+#!/usr/bin/env python3
+"""Generate leetspeak variations of an input phrase.
+
+Substitutions are grouped into three levels so the output stays a useful size:
+
+  1  digit swaps only          a->4  e->3  i->1  o->0  s->5
+  2  + symbol swaps            a->@  b->8  c->(  g->6  h->#  i->!  l->1
+                               s->$  t->7  z->2
+  3  + multi-character swaps   d->|)  k->|<  m->/\\/\\  u->|_|  v->\\/  x-><
+
+Case variants of each letter are always included, as are '-', '_' and ' ' for
+spaces. --max-subs caps how many characters are substituted at once, which is
+what keeps the output realistic: real leetspeak swaps one to three characters,
+not all of them.
+
+Statistics go to stderr, so `leetspeak-generator.py -i "mega corp" > out.txt`
+produces a clean wordlist.
+"""
+
+from __future__ import annotations
+
 import argparse
+import sys
+from pathlib import Path
 
-def predict_permutations(string, leetspeak_dict):
-    """
-    Predicts the total number of leetspeak permutations for a given string.
-    """
-    total_permutations = 1
-    for char in string:
-        if char in leetspeak_dict:
-            total_permutations *= len(leetspeak_dict[char])
+_here = Path(__file__).resolve().parent
+for _candidate in (_here, _here.parent):
+    if (_candidate / "wordlistlib").is_dir():
+        sys.path.insert(0, str(_candidate))
+        break
+
+from wordlistlib import cli, estimate  # noqa: E402
+
+# Substitutions by level. Level N includes every level <= N.
+LEVEL_1 = {"a": ["4"], "e": ["3"], "i": ["1"], "o": ["0"], "s": ["5"]}
+LEVEL_2 = {
+    "a": ["@"], "b": ["8"], "c": ["("], "g": ["6"], "h": ["#"],
+    "i": ["!"], "l": ["1"], "s": ["$"], "t": ["7"], "z": ["2"],
+}
+LEVEL_3 = {
+    "d": ["|)", "|]"], "k": ["|<"], "m": ["/\\/\\"], "n": ["/\\/"],
+    "u": ["|_|"], "v": ["\\/"], "w": ["\\/\\/"], "x": ["><"],
+    "o": ["()"], "l": ["|_"], "c": ["<"], "t": ["+"],
+}
+
+#: Alternatives for a space. These are separators, not substitutions, so they
+#: are not counted against --max-subs.
+SEPARATORS = ["-", "_", " "]
+
+
+def build_table(level: int, keep_case: bool = True) -> dict[str, tuple[list[str], list[str]]]:
+    """Return ``{char: (plain_forms, substitutions)}`` for the given level."""
+    subs: dict[str, list[str]] = {}
+    for table in (LEVEL_1, LEVEL_2, LEVEL_3)[:level]:
+        for char, replacements in table.items():
+            subs.setdefault(char, []).extend(replacements)
+
+    result: dict[str, tuple[list[str], list[str]]] = {}
+    for char in "abcdefghijklmnopqrstuvwxyz":
+        plain = [char, char.upper()] if keep_case else [char]
+        result[char] = (plain, list(dict.fromkeys(subs.get(char, []))))
+    result[" "] = (list(SEPARATORS), [])
+    return result
+
+
+def positions_for(text: str, table) -> list[tuple[list[str], list[str]]]:
+    """Per-character (plain forms, substitutions) for the whole input."""
+    positions = []
+    for char in text:
+        lower = char.lower()
+        if lower in table:
+            plain, subs = table[lower]
+            # An uppercase input letter still only needs its two case forms.
+            positions.append((list(plain), list(subs)))
         else:
-            total_permutations *= 1
-    return total_permutations
+            positions.append(([char], []))
+    return positions
 
-def format_file_size(size_bytes):
-    """
-    Formats file size in appropriate units: KB, MB, GB, or TB.
-    """
-    if size_bytes >= 1024 ** 4:
-        return f"{size_bytes / (1024 ** 4):.2f} TB"
-    elif size_bytes >= 1024 ** 3:
-        return f"{size_bytes / (1024 ** 3):.2f} GB"
-    elif size_bytes >= 1024 ** 2:
-        return f"{size_bytes / (1024 ** 2):.2f} MB"
-    elif size_bytes >= 1024:
-        return f"{size_bytes / 1024:.2f} KB"
-    else:
-        return f"{size_bytes} Bytes"
 
-def estimate_file_size(total_permutations, avg_length):
-    """
-    Estimates the size of the output file based on total permutations and average length of a string.
-    """
-    return total_permutations * (avg_length + 1)  # Include newline character
+def count_and_size(positions, max_subs: int | None) -> tuple[int, int]:
+    """Exact candidate count and exact output size in bytes.
 
-def generate_leetspeak_combinations(word, leetspeak_dict):
+    Computed with a backwards DP over (position, remaining substitution
+    budget), so multi-character substitutions like ``|_|`` are measured at
+    their real length rather than assumed to be one character.
     """
-    Generates leetspeak combinations lazily to reduce memory usage.
-    """
-    word_variations = (
-        leetspeak_dict[char] if char in leetspeak_dict else [char]
-        for char in word
+    budget = len(positions) if max_subs is None else min(max_subs, len(positions))
+    # counts[b] / lengths[b] for the suffix starting at the current position.
+    counts = [1] * (budget + 1)
+    lengths = [0] * (budget + 1)
+
+    for plain, subs in reversed(positions):
+        new_counts = [0] * (budget + 1)
+        new_lengths = [0] * (budget + 1)
+        for b in range(budget + 1):
+            total_count = 0
+            total_length = 0
+            for option in plain:
+                total_count += counts[b]
+                total_length += len(option) * counts[b] + lengths[b]
+            if b > 0:
+                for option in subs:
+                    total_count += counts[b - 1]
+                    total_length += len(option) * counts[b - 1] + lengths[b - 1]
+            new_counts[b] = total_count
+            new_lengths[b] = total_length
+        counts, lengths = new_counts, new_lengths
+
+    count = counts[budget]
+    return count, lengths[budget] + count  # + one newline per candidate
+
+
+def generate(positions, max_subs: int | None):
+    """Yield every candidate, lazily, respecting the substitution budget."""
+    budget = len(positions) if max_subs is None else max_subs
+    acc: list[str] = []
+
+    def walk(index: int, remaining: int):
+        if index == len(positions):
+            yield "".join(acc)
+            return
+        plain, subs = positions[index]
+        for option in plain:
+            acc.append(option)
+            yield from walk(index + 1, remaining)
+            acc.pop()
+        if remaining > 0:
+            for option in subs:
+                acc.append(option)
+                yield from walk(index + 1, remaining - 1)
+                acc.pop()
+
+    yield from walk(0, budget)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Generate leetspeak variations of an input phrase.",
+        epilog=(
+            "Examples:\n"
+            "  leetspeak-generator.py -i 'mega corp' --level 1 -o base.txt\n"
+            "  leetspeak-generator.py -i 'mega corp' --level 3 --max-subs 2 > base.txt\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    for combo in itertools.product(*word_variations):
-        yield ''.join(combo)
+    parser.add_argument(
+        "-i", "--input",
+        help="Input phrase. Prompted for interactively when omitted.",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        help="Output file. Defaults to stdout.",
+    )
+    parser.add_argument(
+        "-l", "--level", type=int, choices=(1, 2, 3), default=2,
+        help="Substitution level: 1 digits, 2 +symbols, 3 +multi-character "
+             "(default: 2).",
+    )
+    parser.add_argument(
+        "-m", "--max-subs", type=int, metavar="N",
+        help="Substitute at most N characters per candidate. Spaces do not "
+             "count. Without this, every substitutable character is swapped "
+             "in every combination.",
+    )
+    parser.add_argument(
+        "--no-case", action="store_true",
+        help="Do not also vary upper/lower case (substitutions only).",
+    )
+    parser.add_argument(
+        "--max-candidates", type=int, default=estimate.DEFAULT_MAX_CANDIDATES,
+        metavar="N", help="Safety limit before --force is required "
+                          f"(default {estimate.DEFAULT_MAX_CANDIDATES:,}).",
+    )
+    cli.add_common_args(parser)
+    return parser
 
-def main():
-    parser = argparse.ArgumentParser(description="A leetspeak generator that takes an input string and generates all possible leetspeak variations.")
-    parser.add_argument('-i', '--input', type=str, help="Input string containing up to three words, separated by spaces. For multiple words, wrap in quotes.")
-    parser.add_argument('-o', '--output', type=str, help="Output file name. If not specified, output will be printed to the screen.")
-    args = parser.parse_args()
 
-    leetspeak_dict = {
-        'a': ['4', '@', 'A', 'a'],
-        'b': ['8', 'B', 'b'],
-        'c': ['(', 'C', 'c'],
-        'd': ['D', 'd', '|)', '|]'],
-        'e': ['3', 'E', 'e'],
-        'f': ['F', 'f'],
-        'g': ['6', 'G', 'g'],
-        'h': ['#', 'H', 'h'],
-        'i': ['1', '!', 'I', 'i'],
-        'j': ['J', 'j'],
-        'k': ['K', 'k'],
-        'l': ['1', 'L', 'l'],
-        'm': ['M', 'm'],
-        'n': ['N', 'n'],
-        'o': ['0', 'O', 'o'],
-        'p': ['P', 'p'],
-        'q': ['Q', 'q'],
-        'r': ['R', 'r'],
-        's': ['5', '$', 'S', 's'],
-        't': ['7', 'T', 't'],
-        'u': ['U', 'u', '|_|'],
-        'v': ['V', 'v'],
-        'w': ['W', 'w'],
-        'x': ['X', 'x'],
-        'y': ['Y', 'y'],
-        'z': ['Z', 'z'],
-        ' ': ['-', '_', ' '],
-    }
+def main() -> None:
+    args = build_parser().parse_args()
+    cli.set_quiet(args.quiet)
 
-    if args.input:
-        input_string = args.input.strip()
+    if args.max_subs is not None and args.max_subs < 0:
+        cli.die("--max-subs cannot be negative")
+
+    if args.input is not None:
+        phrase = args.input.strip()
+    elif sys.stdin.isatty():
+        try:
+            phrase = input("Enter input phrase: ").strip()
+        except EOFError:
+            phrase = ""
     else:
-        input_string = input("Enter input string (up to 3 words): ").strip()
+        phrase = sys.stdin.read().strip()
+    if not phrase:
+        cli.die("no input provided")
 
-    # Calculate total permutations
-    total_permutations = predict_permutations(input_string, leetspeak_dict)
-    avg_length = len(input_string)
-    estimated_size = estimate_file_size(total_permutations, avg_length)
-    formatted_size = format_file_size(estimated_size)
+    table = build_table(args.level, keep_case=not args.no_case)
+    positions = positions_for(phrase, table)
+    total, exact_bytes = count_and_size(positions, args.max_subs)
 
-    # Interactive mode: Confirm before proceeding
-    if not args.input:
-        print(f"Total permutations: {total_permutations}")
-        print(f"Estimated file size: ~{formatted_size}")
-        proceed = input("Do you want to continue? (y/n): ").strip().lower()
-        if proceed != 'y':
-            print("Operation aborted.")
-            sys.exit(0)
+    estimate.confirm_or_exit(
+        total,
+        exact_bytes=exact_bytes,
+        force=args.force,
+        max_candidates=args.max_candidates,
+        label="permutations",
+    )
 
-    # CLI mode: Print stats
-    elif args.input:
-        print(f"Total permutations: {total_permutations}")
-        print(f"Estimated file size: ~{formatted_size}")
+    written = 0
+    with cli.open_output(args.output) as out:
+        for candidate in generate(positions, args.max_subs):
+            out.write(candidate + "\n")
+            written += 1
 
-    # Generate and output combinations
     if args.output:
-        with open(args.output, 'w') as f:
-            for combo in generate_leetspeak_combinations(input_string, leetspeak_dict):
-                f.write(combo + '\n')
-        print(f"Permutations written to {args.output}")
-    else:
-        for combo in generate_leetspeak_combinations(input_string, leetspeak_dict):
-            print(combo)
+        cli.log(f"Wrote {written:,} permutations to {args.output}")
+
 
 if __name__ == "__main__":
     main()

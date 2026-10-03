@@ -1,28 +1,88 @@
+#!/usr/bin/env python3
+"""Apply a single case transformation to every word in a list.
+
+The default --mode swap inverts the case of each character, simulating someone
+who left caps lock on and still used shift. The other modes cover the handful
+of forms that show up constantly in cracked password sets.
+
+For every combination of upper and lower case rather than one transformation,
+use case-permutation.py.
+"""
+
+from __future__ import annotations
+
 import argparse
+import sys
+from pathlib import Path
 
-# Set up argument parser
-parser = argparse.ArgumentParser(description='Swap case for each letter in the input words.')
-parser.add_argument('-i', '--input', type=str, help='Input file containing words, one per line.', required=True)
-parser.add_argument('-o', '--output', type=str, help='Output file to write the swapped case words.')
+_here = Path(__file__).resolve().parent
+for _candidate in (_here, _here.parent):
+    if (_candidate / "wordlistlib").is_dir():
+        sys.path.insert(0, str(_candidate))
+        break
 
-# Parse arguments
-args = parser.parse_args()
+from wordlistlib import cli  # noqa: E402
 
-# Open the input file
-with open(args.input, 'r') as infile:
-    # If an output file is specified, open it; otherwise, set output to None
-    outfile = open(args.output, 'w') if args.output else None
+MODES = {
+    "swap": str.swapcase,
+    "upper": str.upper,
+    "lower": str.lower,
+    "title": str.title,
+    "capitalize": str.capitalize,
+}
 
-    # Process each line from the input file
-    for line in infile:
-        swapped_line = line.strip().swapcase()
 
-        # Write to the output file if specified, otherwise print to stdout
-        if outfile:
-            outfile.write(swapped_line + '\n')
-        else:
-            print(swapped_line)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Swap or normalise the case of each word in a list.",
+        epilog=(
+            "Examples:\n"
+            "  swapcase.py -i dictionary.txt -o swapped.txt\n"
+            "  cat dictionary.txt | swapcase.py --mode title > titled.txt\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-i", "--input",
+        help="Input file, one word per line. Defaults to stdin.",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        help="Output file. Defaults to stdout.",
+    )
+    parser.add_argument(
+        "-m", "--mode", choices=sorted(MODES), default="swap",
+        help="Transformation to apply (default: swap).",
+    )
+    parser.add_argument(
+        "--keep-duplicates", action="store_true",
+        help="Do not drop candidates that are unchanged duplicates of each "
+             "other (e.g. two inputs that upper-case to the same string).",
+    )
+    cli.add_common_args(parser, force=False)
+    return parser
 
-# Close the output file if it was opened
-if outfile:
-    outfile.close()
+
+def main() -> None:
+    args = build_parser().parse_args()
+    cli.set_quiet(args.quiet)
+    transform = MODES[args.mode]
+
+    read = written = 0
+    seen: set[str] = set()
+    with cli.open_input(args.input) as infile, cli.open_output(args.output) as outfile:
+        for line in cli.iter_lines(infile):
+            read += 1
+            candidate = transform(line)
+            if not args.keep_duplicates:
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+            outfile.write(candidate + "\n")
+            written += 1
+
+    cli.log(f"Read {read:,} words, wrote {written:,} with mode '{args.mode}'.")
+
+
+if __name__ == "__main__":
+    main()

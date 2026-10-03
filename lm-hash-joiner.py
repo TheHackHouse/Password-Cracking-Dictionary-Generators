@@ -1,100 +1,194 @@
+#!/usr/bin/env python3
+"""Rejoin cracked LM hash halves back into whole passwords.
+
+Workflow this fits into:
+
+  1. Crack the LM hashes            hashcat -m 3000 lm.txt ...
+  2. Rejoin the halves (this tool)  lm-hash-joiner.py lm.pot lm-hashes.txt
+  3. Recover the real case          --permute-case, or case-permutation.py
+  4. Attack the NT hashes with the resulting list
+
+Step 3 matters because LM is case-insensitive: everything this tool recovers
+is uppercase and will not match the corresponding NT hash as-is.
+
+Statistics go to stderr, so `lm-hash-joiner.py a.pot b.txt > list.txt` gives a
+clean wordlist.
+"""
+
+from __future__ import annotations
+
 import argparse
+import re
+import sys
+from pathlib import Path
 
-def load_pot_file(pot_file):
-    """Load the POT file into a dictionary mapping LM hash halves to plaintexts.
+_here = Path(__file__).resolve().parent
+for _candidate in (_here, _here.parent):
+    if (_candidate / "wordlistlib").is_dir():
+        sys.path.insert(0, str(_candidate))
+        break
 
-    Expected format (each line in the file):
-        LM_HASH_HALF:PLAINTEXT
-    Example:
-        299BD128C1101FD6:PASSWORD
-        D9D99F2F2B43B62F:1234567
+from wordlistlib import caseperm, cli  # noqa: E402
 
-    Returns:
-        dict: A dictionary where keys are LM hash halves (uppercase) and values are plaintext passwords.
+#: LM hash of an empty 7-character half. Resolves to "", not a failed lookup.
+BLANK_HALF = "AAD3B435B51404EE"
+NOT_FOUND = "<HASH_NOT_FOUND>"
+
+HEX16 = re.compile(r"^[0-9A-F]{16}$")
+HEX32 = re.compile(r"^[0-9A-F]{32}$")
+
+
+def load_pot_file(pot_file: str) -> dict[str, str]:
+    """Load ``LM_HASH_HALF:PLAINTEXT`` lines into a lookup table.
+
+    Accepts hashcat's bare ``<16 hex>:<plain>`` and John's ``$LM$<16 hex>:<plain>``.
     """
-    pot_dict = {}
-    with open(pot_file, 'r', encoding='utf-8') as file:
-        for line in file:
-            parts = line.strip().split(':', 1)
-            if len(parts) == 2:
-                lm_half, plaintext = parts
-                pot_dict[lm_half.upper()] = plaintext  # Store in uppercase (LM hashes are case-insensitive)
-    return pot_dict
-
-def process_lm_hash_file(lm_hash_file, pot_dict, export_full):
-    """Replace LM hash halves with plaintext equivalents.
-    This is used when you crack LM hashes and need to join them back together to make a full password
-    The password list should then be run through the case-permutation.py script and used as a password list against
-    the NT hashes remaining. 
-    
-    Expected format of `lm_hash_file` (each line contains a full LM hash - 32 characters long):
-        FULL_LM_HASH
-    Example:
-        299BD128C1101FD6D9D99F2F2B43B62F
-        5D41402ABC4B2A76A5E7C9A317E4B403
-
-    If a half-hash is found in the `pot_dict`, it is replaced with its plaintext equivalent.
-    If not found, it is replaced with '<HASH_NOT_FOUND>' to indicate missing data.
-
-    Args:
-        lm_hash_file (str): Path to a file containing full LM hashes.
-        pot_dict (dict): Dictionary mapping LM hash halves to plaintexts.
-        export_full (bool): If True, output will include full LM hash along with plaintext.
-
-    Returns:
-        list: List of formatted output strings with plaintext replacements.
-    """
-    output_lines = []
-    
-    with open(lm_hash_file, 'r', encoding='utf-8') as file:
-        for line in file:
-            full_lm_hash = line.strip().upper()  # Ensure uppercase
-            if len(full_lm_hash) != 32:
-                continue  # Skip invalid lines
-            
-            first_half, second_half = full_lm_hash[:16], full_lm_hash[16:]
-            plain_first = pot_dict.get(first_half, <'HASH_NOT_FOUND>')  # Use HASH_NOT_FOUND if not found
-            plain_second = pot_dict.get(second_half, '<HASH_NOT_FOUND>')
-
-            if export_full:
-                output_lines.append(f"{full_lm_hash}:{plain_first}{plain_second}")
+    pot: dict[str, str] = {}
+    skipped = 0
+    with cli.open_input(pot_file) as handle:
+        for line in cli.iter_lines(handle):
+            if line.startswith("$LM$"):
+                line = line[len("$LM$"):]
+            half, sep, plaintext = line.partition(":")
+            if not sep:
+                skipped += 1
+                continue
+            half = half.strip().upper()
+            if HEX16.match(half):
+                pot[half] = plaintext
             else:
-                output_lines.append(f"{plain_first}{plain_second}")
-    
-    return output_lines
+                skipped += 1
+    if skipped:
+        cli.warn(f"{skipped:,} unparseable line(s) in {pot_file} were ignored")
+    if not pot:
+        cli.die(f"{pot_file} contained no usable LM half-hash entries")
+    cli.log(f"Loaded {len(pot):,} cracked LM halves from {pot_file}")
+    return pot
 
-def main():
-    parser = argparse.ArgumentParser(description="Replace LM hash halves with plaintext from a POT file.")
+
+def resolve(half: str, pot: dict[str, str]) -> tuple[str, bool]:
+    """Return ``(plaintext, found)`` for one LM half."""
+    if half == BLANK_HALF:
+        return "", True          # empty half: the password is under 8 chars
+    if half in pot:
+        return pot[half], True
+    return NOT_FOUND, False
+
+
+def process(hash_file: str, pot: dict[str, str], args):
+    """Yield output lines, streaming rather than buffering the whole result."""
+    stats = {"lines": 0, "skipped": 0, "complete": 0, "partial": 0, "missing": 0}
+
+    with cli.open_input(hash_file) as handle:
+        for line in cli.iter_lines(handle):
+            # Tolerate `user:rid:LMHASH:NTHASH:::` as well as a bare LM hash.
+            candidate = line.upper()
+            if not HEX32.match(candidate):
+                fields = [f.strip().upper() for f in candidate.split(":")]
+                candidate = next((f for f in fields if HEX32.match(f)), "")
+            if not HEX32.match(candidate):
+                stats["skipped"] += 1
+                continue
+
+            stats["lines"] += 1
+            first, second = candidate[:16], candidate[16:]
+            plain_first, found_first = resolve(first, pot)
+            plain_second, found_second = resolve(second, pot)
+            password = plain_first + plain_second
+
+            if found_first and found_second:
+                stats["complete"] += 1
+            elif found_first or found_second:
+                stats["partial"] += 1
+            else:
+                stats["missing"] += 1
+
+            if args.only_cracked and not (found_first and found_second):
+                continue
+
+            if args.permute_case and found_first and found_second:
+                for variant in caseperm.permutations(password, args.max_upper):
+                    yield f"{candidate}:{variant}" if args.full else variant
+            else:
+                yield f"{candidate}:{password}" if args.full else password
+
+    cli.log(
+        f"Read {stats['lines']:,} LM hashes "
+        f"({stats['skipped']:,} unparseable lines skipped)"
+    )
+    cli.log(
+        f"Fully recovered: {stats['complete']:,} | "
+        f"partially recovered: {stats['partial']:,} | "
+        f"not cracked: {stats['missing']:,}"
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Rejoin cracked LM hash halves into whole passwords.",
+        epilog=(
+            "Examples:\n"
+            "  lm-hash-joiner.py lm.pot lm-hashes.txt -o joined.txt\n"
+            "  lm-hash-joiner.py lm.pot lm-hashes.txt --only-cracked "
+            "--permute-case -m 2 > nt-candidates.txt\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "pot_file",
-        help="Path to the POT file containing mappings of half LM hashes to plaintext passwords. "
-             "Expected format: LM_HASH_HALF:PLAINTEXT (one per line)."
+        help="POT file of cracked LM halves. Format: LM_HASH_HALF:PLAINTEXT "
+             "(hashcat -m 3000) or $LM$HASH:PLAINTEXT (John).",
     )
     parser.add_argument(
-        "lm_hash_file",
-        help="Path to the file containing full LM hashes (32-character hex strings, one per line)."
+        "hash_file",
+        help="File of full 32-character LM hashes, one per line. Lines from a "
+             "dcsync/NTDS dump are accepted too; the LM field is picked out.",
+    )
+    parser.add_argument("-o", "--output", help="Output file. Defaults to stdout.")
+    parser.add_argument(
+        "--full", action="store_true",
+        help="Prefix each result with the original LM hash (HASH:PLAINTEXT).",
     )
     parser.add_argument(
-        "-o", "--output",
-        help="Path to the output file where results will be saved. Default: 'output.txt'.",
-        default="output.txt"
+        "--only-cracked", action="store_true",
+        help=f"Omit entries where a half is missing, instead of emitting {NOT_FOUND}.",
     )
     parser.add_argument(
-        "--full",
-        action="store_true",
-        help="If set, output will include full LM hash along with the corresponding plaintext. "
-             "Otherwise, only the plaintext is output."
+        "--permute-case", action="store_true",
+        help="Also emit case permutations of each recovered password. LM is "
+             "case-insensitive, so this is what makes the output usable "
+             "against the matching NT hashes.",
     )
-    
-    args = parser.parse_args()
-    
-    pot_dict = load_pot_file(args.pot_file)
-    results = process_lm_hash_file(args.lm_hash_file, pot_dict, args.full)
+    parser.add_argument(
+        "-m", "--max-upper", type=int, metavar="N",
+        help="With --permute-case, uppercase at most N characters per "
+             "candidate. Strongly recommended: without it a 14-character "
+             "password expands to 16,384 candidates.",
+    )
+    cli.add_common_args(parser, force=False)
+    return parser
 
-    with open(args.output, "w", encoding="utf-8") as out_file:
-        out_file.write("\n".join(results) + "\n")
-    
-    print(f"Processing complete. Results saved to {args.output}")
+
+def main() -> None:
+    args = build_parser().parse_args()
+    cli.set_quiet(args.quiet)
+
+    if args.max_upper is not None and args.max_upper < 0:
+        cli.die("--max-upper cannot be negative")
+    if args.max_upper is not None and not args.permute_case:
+        cli.warn("--max-upper has no effect without --permute-case")
+
+    pot = load_pot_file(args.pot_file)
+
+    written = 0
+    with cli.open_output(args.output) as out:
+        for line in process(args.hash_file, pot, args):
+            out.write(line + "\n")
+            written += 1
+
+    if args.output:
+        cli.log(f"Wrote {written:,} lines to {args.output}")
+
 
 if __name__ == "__main__":
     main()
