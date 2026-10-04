@@ -111,26 +111,129 @@ def count_and_size(positions, max_subs: int | None) -> tuple[int, int]:
 
 
 def generate(positions, max_subs: int | None):
-    """Yield every candidate, lazily, respecting the substitution budget."""
-    budget = len(positions) if max_subs is None else max_subs
-    acc: list[str] = []
+    """Yield every candidate, lazily, respecting the substitution budget.
 
-    def walk(index: int, remaining: int):
-        if index == len(positions):
-            yield "".join(acc)
-            return
+    The candidate is carried down as a string and the last position is
+    expanded inside the loop, rather than recursing once more and joining an
+    accumulator list at every leaf. Emission order is unchanged.
+    """
+    if not positions:
+        return
+    budget = len(positions) if max_subs is None else max_subs
+    last = len(positions) - 1
+
+    def walk(index: int, prefix: str, remaining: int):
         plain, subs = positions[index]
+        if index == last:
+            for option in plain:
+                yield prefix + option
+            if remaining > 0:
+                for option in subs:
+                    yield prefix + option
+            return
         for option in plain:
-            acc.append(option)
-            yield from walk(index + 1, remaining)
-            acc.pop()
+            yield from walk(index + 1, prefix + option, remaining)
         if remaining > 0:
             for option in subs:
-                acc.append(option)
-                yield from walk(index + 1, remaining - 1)
-                acc.pop()
+                yield from walk(index + 1, prefix + option, remaining - 1)
 
-    yield from walk(0, budget)
+    yield from walk(0, "", budget)
+
+
+# --------------------------------------------------------------------------
+# hashcat rule output
+# --------------------------------------------------------------------------
+
+def rule_substitutions(table, phrase: str | None):
+    r"""``{letter: [single-character substitutions]}`` expressible as rules.
+
+    Two limits of hashcat's ``sXY``, both reported and skipped:
+
+    * X and Y must each be a single character, so the multi-character
+      level-3 forms (``|_|``, ``|)``, ``/\/\``) and the space separators
+      cannot be expressed.
+    * ``sa4`` replaces *every* ``a`` in the word. Wordlist mode substitutes
+      each position independently, so it can produce ``meg4corp`` *and*
+      ``m3gacorp`` *and* ``b4nana``; the rule set cannot produce ``b4nana``
+      from ``banana`` without also changing the other two a's. The rules are
+      therefore a subset of the wordlist, traded for applying to every word
+      in a dictionary at GPU speed.
+    """
+    if phrase:
+        letters = sorted({c.lower() for c in phrase if c.lower() in table and c != " "})
+    else:
+        letters = sorted(c for c in table if c != " ")
+
+    usable, dropped = {}, []
+    for letter in letters:
+        _, subs = table[letter]
+        single = [sub for sub in subs if len(sub) == 1]
+        dropped.extend(sub for sub in subs if len(sub) != 1)
+        if single:
+            usable[letter] = single
+    return usable, dropped
+
+
+def count_substitution_rules(usable: dict[str, list[str]], max_subs: int | None) -> int:
+    letters = list(usable)
+    budget = len(letters) if max_subs is None else min(max_subs, len(letters))
+    # counts[k] = number of ways to substitute exactly k of the letters seen
+    counts = [1] + [0] * budget
+    for letter in letters:
+        options = len(usable[letter])
+        for k in range(budget, 0, -1):
+            counts[k] += counts[k - 1] * options
+    return sum(counts)
+
+
+def substitution_rules(usable: dict[str, list[str]], max_subs: int | None):
+    """Yield hashcat ``sXY`` rules covering the same substitutions."""
+    letters = list(usable)
+    budget = len(letters) if max_subs is None else max_subs
+
+    def walk(index: int, prefix: str, remaining: int):
+        if index == len(letters):
+            yield prefix or ":"      # ":" is hashcat's do-nothing rule
+            return
+        letter = letters[index]
+        yield from walk(index + 1, prefix, remaining)
+        if remaining > 0:
+            for sub in usable[letter]:
+                yield from walk(index + 1, prefix + f"s{letter}{sub}", remaining - 1)
+
+    yield from walk(0, "", budget)
+
+
+def emit_rules(args, table) -> None:
+    usable, dropped = rule_substitutions(table, args.input)
+    if dropped:
+        cli.warn(
+            f"{len(dropped)} multi-character substitution(s) cannot be expressed "
+            f"as hashcat rules and were skipped: {' '.join(sorted(set(dropped)))}"
+        )
+    if " " in (args.input or ""):
+        cli.warn("space separators cannot be expressed as rules and were skipped")
+    if not usable:
+        cli.die("no rule-expressible substitutions at this level")
+
+    total = count_substitution_rules(usable, args.max_subs)
+    estimate.confirm_or_exit(
+        cli.sliced_total(total, args),
+        avg_length=3 * (args.max_subs or len(usable)),
+        force=args.force,
+        max_candidates=args.max_candidates,
+        label="rules",
+    )
+
+    with cli.open_output(args.output, compress=args.gzip) as out:
+        writer = cli.CandidateWriter(out, skip=args.skip or 0, limit=args.limit)
+        writer.feed(substitution_rules(usable, args.max_subs))
+        writer.close()
+
+    cli.log(f"Rules: {writer.report()}"
+            + (f" -> {args.output}" if args.output else ""))
+    cli.log(f"Covering letters: {' '.join(usable)}")
+    cli.log("Apply with: hashcat -m <mode> hashes.txt dict.txt -r <this file>")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -163,6 +266,13 @@ def build_parser() -> argparse.ArgumentParser:
              "in every combination.",
     )
     parser.add_argument(
+        "--rules", action="store_true",
+        help="Emit a hashcat .rule file of sXY substitutions instead of a "
+             "wordlist, so the substitutions apply to a whole dictionary "
+             "rather than one phrase. Multi-character substitutions are not "
+             "expressible as rules and are skipped.",
+    )
+    parser.add_argument(
         "--no-case", action="store_true",
         help="Do not also vary upper/lower case (substitutions only).",
     )
@@ -172,6 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
                           f"(default {estimate.DEFAULT_MAX_CANDIDATES:,}).",
     )
     cli.add_common_args(parser)
+    cli.add_output_args(parser)
     return parser
 
 
@@ -195,25 +306,29 @@ def main() -> None:
         cli.die("no input provided")
 
     table = build_table(args.level, keep_case=not args.no_case)
+
+    if args.rules:
+        emit_rules(args, table)
+        return
+
     positions = positions_for(phrase, table)
     total, exact_bytes = count_and_size(positions, args.max_subs)
 
     estimate.confirm_or_exit(
-        total,
+        cli.sliced_total(total, args),
         exact_bytes=exact_bytes,
         force=args.force,
         max_candidates=args.max_candidates,
         label="permutations",
     )
 
-    written = 0
-    with cli.open_output(args.output) as out:
-        for candidate in generate(positions, args.max_subs):
-            out.write(candidate + "\n")
-            written += 1
+    with cli.open_output(args.output, compress=args.gzip) as out:
+        writer = cli.writer_for(out, args)
+        writer.feed(generate(positions, args.max_subs))
+        writer.close()
 
-    if args.output:
-        cli.log(f"Wrote {written:,} permutations to {args.output}")
+    cli.log(f"Permutations: {writer.report()}"
+            + (f" -> {args.output}" if args.output else ""))
 
 
 if __name__ == "__main__":

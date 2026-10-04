@@ -31,6 +31,7 @@ static void usage(const char *prog) {
         "  -o, --output FILE    Output file. Defaults to stdout.\n"
         "  -m, --max-upper N    Uppercase at most N characters per candidate.\n"
         "      --force          Skip the size confirmation prompt.\n"
+        "  -q, --quiet          Suppress statistics on stderr.\n"
         "  -h, --help           Show this message.\n",
         prog);
 }
@@ -60,6 +61,7 @@ int main(int argc, char *argv[]) {
     const char *output_file = NULL;
     int max_upper = -1;           /* -1 means "no cap" */
     int force = 0;
+    int quiet = 0;
     int have_word = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -69,6 +71,8 @@ int main(int argc, char *argv[]) {
             return EXIT_SUCCESS;
         } else if (!strcmp(arg, "--force")) {
             force = 1;
+        } else if (!strcmp(arg, "-q") || !strcmp(arg, "--quiet")) {
+            quiet = 1;
         } else if (!strcmp(arg, "-w") || !strcmp(arg, "--word")) {
             if (++i >= argc) { fprintf(stderr, "error: %s needs a value\n", arg); return EXIT_FAILURE; }
             if (strlen(argv[i]) > MAX_LENGTH) {
@@ -144,10 +148,12 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    char size_text[32];
-    human_size((double)total * (double)(length + 1), size_text, sizeof(size_text));
-    fprintf(stderr, "Total permutations: %llu\n", total);
-    fprintf(stderr, "Output size: ~%s\n", size_text);
+    if (!quiet) {
+        char size_text[32];
+        human_size((double)total * (double)(length + 1), size_text, sizeof(size_text));
+        fprintf(stderr, "Total permutations: %llu\n", total);
+        fprintf(stderr, "Output size: ~%s\n", size_text);
+    }
 
     if (!force && total > 50000000ULL) {
         if (isatty(STDIN_FILENO)) {
@@ -171,28 +177,80 @@ int main(int argc, char *argv[]) {
     static char outbuf[OUT_BUFSIZ];
     setvbuf(out, outbuf, _IOFBF, sizeof(outbuf));
 
-    /* Iterate over bitmasks instead of recursing: bit i set means position
-       positions[i] is uppercased. Makes --max-upper a popcount test. */
+    /* Candidates are packed into one large block and written in bulk. A
+       per-candidate fwrite costs a call plus a memcpy each time, which at
+       millions of candidates is a measurable share of the runtime. */
+    static char block[OUT_BUFSIZ];
+    size_t block_used = 0;
+    const size_t record = (size_t)length + 1;
+    const size_t block_limit = sizeof(block) - record;
+#define EMIT()                                                   \
+    do {                                                         \
+        if (block_used > block_limit) {                          \
+            fwrite(block, 1, block_used, out);                   \
+            block_used = 0;                                      \
+        }                                                        \
+        memcpy(block + block_used, candidate, record);           \
+        block_used += record;                                    \
+    } while (0)
+
+    /* Iterate over bitmasks instead of recursing. Bit i maps to the cased
+       position counted from the RIGHT, so the last character varies fastest
+       and the emission order matches itertools.product in the Python twin --
+       the two produce byte-identical files. Makes --max-upper a popcount
+       test. */
     char candidate[MAX_LENGTH + 2];
     memcpy(candidate, word, (size_t)length);
     candidate[length] = '\n';
     candidate[length + 1] = '\0';
 
-    unsigned long long masks = (cased >= 63) ? 0ULL : (1ULL << cased);
-    for (unsigned long long mask = 0; mask < masks; mask++) {
-        if (max_upper >= 0 && __builtin_popcountll(mask) > max_upper) continue;
-        for (int i = 0; i < cased; i++) {
-            int p = positions[i];
-            candidate[p] = (mask >> i) & 1ULL
-                ? (char)toupper((unsigned char)word[p])
-                : word[p];
+    if (max_upper < 0) {
+        /* Unrestricted: walk every bitmask. Bit i maps to the cased position
+           counted from the RIGHT, so the last character varies fastest and
+           the order matches itertools.product in the Python twin -- the two
+           produce byte-identical files. */
+        unsigned long long masks = 1ULL << cased;
+        for (unsigned long long mask = 0; mask < masks; mask++) {
+            for (int i = 0; i < cased; i++) {
+                int p = positions[cased - 1 - i];
+                candidate[p] = (mask >> i) & 1ULL
+                    ? (char)toupper((unsigned char)word[p])
+                    : word[p];
+            }
+            EMIT();
         }
-        fwrite(candidate, 1, (size_t)length + 1, out);
+    } else {
+        /* Capped: enumerate combinations directly rather than filtering 2^n
+           masks by popcount, which is what makes `-m 2` on a long word cheap.
+           Order matches itertools.combinations in the Python twin. */
+        int idx[MAX_LENGTH];
+        for (int k = 0; k <= max_upper; k++) {
+            if (k > cased) break;
+            for (int i = 0; i < k; i++) idx[i] = i;
+            while (1) {
+                for (int i = 0; i < cased; i++) candidate[positions[i]] = word[positions[i]];
+                for (int i = 0; i < k; i++) {
+                    int p = positions[idx[i]];
+                    candidate[p] = (char)toupper((unsigned char)word[p]);
+                }
+                EMIT();
+
+                if (k == 0) break;
+                int i = k - 1;
+                while (i >= 0 && idx[i] == cased - k + i) i--;
+                if (i < 0) break;
+                idx[i]++;
+                for (int j = i + 1; j < k; j++) idx[j] = idx[j - 1] + 1;
+            }
+        }
     }
+
+    if (block_used) fwrite(block, 1, block_used, out);
+#undef EMIT
 
     if (out != stdout) {
         fclose(out);
-        fprintf(stderr, "Wrote %llu permutations to %s\n", total, output_file);
+        if (!quiet) fprintf(stderr, "Wrote %llu permutations to %s\n", total, output_file);
     }
     return EXIT_SUCCESS;
 }

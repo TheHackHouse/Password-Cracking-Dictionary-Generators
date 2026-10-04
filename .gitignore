@@ -23,5 +23,12 @@ specials.txt
 *.pot
 *.wordlist
 
+# Local working notes, not part of the published toolkit
+plan.md
+plan-*.md
+NOTES.md
+TODO.md
+scratch/
+
 # OS
 .DS_Store

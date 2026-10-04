@@ -22,40 +22,7 @@ for _candidate in (_here, _here.parent):
         sys.path.insert(0, str(_candidate))
         break
 
-from wordlistlib import cli  # noqa: E402
-
-
-def load_english_words(custom_dict: str | None) -> set[str]:
-    """Load the reference vocabulary, lowercased."""
-    if custom_dict:
-        with cli.open_input(custom_dict) as handle:
-            vocabulary = {word.lower() for word in cli.iter_lines(handle)}
-        if not vocabulary:
-            cli.die(f"{custom_dict} contained no words")
-        cli.log(f"Loaded {len(vocabulary):,} words from {custom_dict}")
-        return vocabulary
-
-    try:
-        import nltk
-    except ImportError:
-        cli.die(
-            "nltk is not installed. Either `pip install nltk` or pass "
-            "--custom-dict with your own word list."
-        )
-
-    # Only hit the network when the corpus is genuinely missing; the previous
-    # version re-downloaded on every single run.
-    try:
-        nltk.data.find("corpora/words")
-    except LookupError:
-        cli.log("Downloading the NLTK 'words' corpus (one time)...")
-        nltk.download("words", quiet=True)
-
-    from nltk.corpus import words as nltk_words
-
-    vocabulary = {word.lower() for word in nltk_words.words()}
-    cli.log(f"Loaded {len(vocabulary):,} words from the NLTK corpus")
-    return vocabulary
+from wordlistlib import cli, vocab  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -73,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-o", "--output", help="Output file. Defaults to stdout.")
     parser.add_argument(
         "--custom-dict", "--custom_dict", dest="custom_dict",
-        help="Reference word list to compare against, instead of the NLTK corpus.",
+        help="Reference word list to compare against. Without it the NLTK corpus is used, falling back to the system word list.",
     )
     parser.add_argument(
         "--invert", action="store_true",
@@ -92,7 +59,7 @@ def main() -> None:
     args = build_parser().parse_args()
     cli.set_quiet(args.quiet)
 
-    vocabulary = load_english_words(args.custom_dict)
+    vocabulary = vocab.load(args.custom_dict)
 
     checked = matched = 0
     with cli.open_input(args.input) as infile, cli.open_output(args.output) as outfile:

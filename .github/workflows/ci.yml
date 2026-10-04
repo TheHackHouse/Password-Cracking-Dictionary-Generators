@@ -40,8 +40,21 @@ jobs:
       - uses: actions/checkout@v4
       - name: Compile case-permutation.c
         run: gcc -O3 -Wall -Wextra -Werror -o case-permutation case-permutation.c
-      - name: Smoke test
+      # The Python tool hands off to this binary when it is present, so the
+      # two must agree byte for byte, not merely as a set.
+      - name: C and Python must be byte-identical
         run: |
-          ./case-permutation -w a1 --force | sort > c.txt
-          python3 case-permutation.py -w a1 -q --force | sort > py.txt
-          diff c.txt py.txt
+          for w in a1 abc pa55w0rd megacorp; do
+            for m in "" "-m 0" "-m 1" "-m 2" "-m 99"; do
+              ./case-permutation -w "$w" $m -q --force > c.txt
+              python3 case-permutation.py -w "$w" $m -q --force --no-c > py.txt
+              diff c.txt py.txt || { echo "MISMATCH: $w $m"; exit 1; }
+            done
+          done
+          echo "byte-identical across all words and caps"
+
+      - name: Python hands off to the compiled binary
+        run: |
+          python3 case-permutation.py -w abc --force 2>&1 >/dev/null \
+            | grep -q "Using the compiled" \
+            || { echo "handoff did not happen"; exit 1; }

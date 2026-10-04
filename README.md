@@ -28,13 +28,18 @@ past 50 million (`--max-candidates` to change, `--force` to skip).
 
 ## Install
 
-Nothing to install for most tools — they are standalone Python 3.10+ scripts
-that only need the `wordlistlib/` directory alongside them.
+Nothing to install — they are standalone Python 3.10+ scripts that only need
+the `wordlistlib/` directory alongside them.
 
 ```sh
-pip install -r requirements.txt     # only for dict-compare / dict-extractor
 gcc -O3 -march=native -o case-permutation case-permutation.c   # optional fast path
+pip install -r requirements.txt   # optional: nltk, for dict-compare/dict-extractor
 ```
+
+`dict-compare.py` and `dict-extractor.py` need a reference word list. They use
+`--custom-dict` if you give them one, otherwise the NLTK corpus if `nltk` is
+installed, otherwise the system word list at `/usr/share/dict/words`. So
+`nltk` is optional.
 
 ---
 
@@ -125,6 +130,10 @@ multiple-words-joiner.py -d names.txt -d years.txt -D '-' -a '!' -o list.txt
 
 Repeat `-d` for as many dictionaries as you like. The first is streamed from
 disk rather than loaded into memory.
+
+`--prepend` and `--append` are separated from the words by `--delimiter`, so
+`-p corp -D -` gives `corp-mega-2025`. Pass `--no-affix-delimiter` to butt
+them straight against the words instead.
 
 ### swapcase.py
 
@@ -230,9 +239,9 @@ dict-compare.py -i cracked.txt -o not-words.txt
 dict-compare.py -i cracked.txt --invert --custom-dict english.txt
 ```
 
-The NLTK `words` corpus is the fallback but it is archaic and has no names,
-brands or plurals; `--custom-dict` with a real cracked-password corpus gives
-much better results, and avoids the `nltk` dependency entirely.
+Both the NLTK corpus and `/usr/share/dict/words` are archaic and have no
+names, brands or plurals, so `--custom-dict` with a real cracked-password
+corpus gives much better results.
 
 ### filter-by-length.py
 
@@ -308,10 +317,16 @@ here fails CI.
 | `-o, --output OUTPUT` | Output file. Defaults to stdout. |
 | `-l, --level {1,2,3}` | Substitution level: 1 digits, 2 +symbols, 3 +multi-character (default: 2). |
 | `-m, --max-subs N` | Substitute at most N characters per candidate. Spaces do not count. Without this, every substitutable character is swapped in every combination. |
+| `--rules` | Emit a hashcat .rule file of sXY substitutions instead of a wordlist, so the substitutions apply to a whole dictionary rather than one phrase. Multi-character substitutions are not expressible as rules and are skipped. |
 | `--no-case` | Do not also vary upper/lower case (substitutions only). |
 | `--max-candidates N` | Safety limit before --force is required (default 50,000,000). |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
 | `--force` | Skip the size confirmation prompt (for scripted runs). |
+| `--min-length N` | Drop candidates shorter than N characters before writing them. |
+| `--max-length N` | Drop candidates longer than N characters before writing them. |
+| `--skip N` | Skip the first N candidates, like hashcat's -s. Use with --limit to split one job across machines. |
+| `--limit N` | Stop after writing N candidates, like hashcat's -l. |
+| `--gzip` | Write a gzip stream. hashcat 6.2.4+ reads gzipped wordlists directly. Implied by a .gz output path. |
 
 **case-permutation.py**
 
@@ -321,10 +336,18 @@ here fails CI.
 | `-i, --input, -f, --file INPUT` | File of words, one per line. Defaults to stdin when -w is not given. |
 | `-o, --output OUTPUT` | Output file. Defaults to stdout. |
 | `-m, --max-upper N` | Uppercase at most N characters per candidate. Turns 2^n growth into something manageable for long inputs. |
+| `--no-c` | Do not hand off to the compiled case-permutation binary even if one is present. |
+| `--rules` | Emit a hashcat .rule file instead of a wordlist. The rules reproduce the same candidates but apply to every word in a dictionary, so a 10k-word list costs 2^n rules rather than 10k x 2^n lines. See --positions. |
+| `--positions N` | With --rules, how many character positions to toggle (default: the length of the longest input word). hashcat can address 36 positions. |
 | `--common` | Skip the full permutation and emit only lower, UPPER, Capitalised, swapped and Title case. |
 | `--max-candidates N` | Safety limit before --force is required (default 50,000,000). |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
 | `--force` | Skip the size confirmation prompt (for scripted runs). |
+| `--min-length N` | Drop candidates shorter than N characters before writing them. |
+| `--max-length N` | Drop candidates longer than N characters before writing them. |
+| `--skip N` | Skip the first N candidates, like hashcat's -s. Use with --limit to split one job across machines. |
+| `--limit N` | Stop after writing N candidates, like hashcat's -l. |
+| `--gzip` | Write a gzip stream. hashcat 6.2.4+ reads gzipped wordlists directly. Implied by a .gz output path. |
 
 **keyboard-walk.py**
 
@@ -336,6 +359,11 @@ here fails CI.
 | `--max-candidates N` | Safety limit before --force is required (default 50,000,000). |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
 | `--force` | Skip the size confirmation prompt (for scripted runs). |
+| `--min-length N` | Drop candidates shorter than N characters before writing them. |
+| `--max-length N` | Drop candidates longer than N characters before writing them. |
+| `--skip N` | Skip the first N candidates, like hashcat's -s. Use with --limit to split one job across machines. |
+| `--limit N` | Stop after writing N candidates, like hashcat's -l. |
+| `--gzip` | Write a gzip stream. hashcat 6.2.4+ reads gzipped wordlists directly. Implied by a .gz output path. |
 
 **multiple-words-joiner.py**
 
@@ -345,13 +373,19 @@ here fails CI.
 | `-d, --dict FILE` | Dictionary file, one word per line. Repeat for each dictionary. |
 | `-o, --output OUTPUT` | Output file. Defaults to stdout. |
 | `-D, --delimiter DELIMITER` | String placed between words (default: none). |
-| `-p, --prepend PREPEND` | Static string placed at the start of each candidate. |
-| `-a, --append APPEND` | Static string placed at the end of each candidate. |
+| `-p, --prepend PREPEND` | Static string placed at the start of each candidate. It is separated from the first word by --delimiter; use --no-affix-delimiter to butt it straight up against the word. |
+| `-a, --append APPEND` | Static string placed at the end of each candidate, separated from the last word by --delimiter. |
+| `--no-affix-delimiter` | Concatenate --prepend and --append directly, with no delimiter between them and the words. |
 | `--min-words N` | With -i, the fewest words per candidate (default: all of them). |
 | `--max-words N` | With -i, the most words per candidate (default: all of them). |
 | `--max-candidates N` | Safety limit before --force is required (default 50,000,000). |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
 | `--force` | Skip the size confirmation prompt (for scripted runs). |
+| `--min-length N` | Drop candidates shorter than N characters before writing them. |
+| `--max-length N` | Drop candidates longer than N characters before writing them. |
+| `--skip N` | Skip the first N candidates, like hashcat's -s. Use with --limit to split one job across machines. |
+| `--limit N` | Stop after writing N candidates, like hashcat's -l. |
+| `--gzip` | Write a gzip stream. hashcat 6.2.4+ reads gzipped wordlists directly. Implied by a .gz output path. |
 
 **swapcase.py**
 
@@ -362,6 +396,11 @@ here fails CI.
 | `-m, --mode {capitalize,lower,swap,title,upper}` | Transformation to apply (default: swap). |
 | `--keep-duplicates` | Do not drop candidates that are unchanged duplicates of each other (e.g. two inputs that upper-case to the same string). |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
+| `--min-length N` | Drop candidates shorter than N characters before writing them. |
+| `--max-length N` | Drop candidates longer than N characters before writing them. |
+| `--skip N` | Skip the first N candidates, like hashcat's -s. Use with --limit to split one job across machines. |
+| `--limit N` | Stop after writing N candidates, like hashcat's -l. |
+| `--gzip` | Write a gzip stream. hashcat 6.2.4+ reads gzipped wordlists directly. Implied by a .gz output path. |
 
 ### Hash joiners
 
@@ -375,6 +414,11 @@ here fails CI.
 | `--permute-case` | Also emit case permutations of each recovered password. LM is case-insensitive, so this is what makes the output usable against the matching NT hashes. |
 | `-m, --max-upper N` | With --permute-case, uppercase at most N characters per candidate. Strongly recommended: without it a 14-character password expands to 16,384 candidates. |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
+| `--min-length N` | Drop candidates shorter than N characters before writing them. |
+| `--max-length N` | Drop candidates longer than N characters before writing them. |
+| `--skip N` | Skip the first N candidates, like hashcat's -s. Use with --limit to split one job across machines. |
+| `--limit N` | Stop after writing N candidates, like hashcat's -l. |
+| `--gzip` | Write a gzip stream. hashcat 6.2.4+ reads gzipped wordlists directly. Implied by a .gz output path. |
 
 **nt-hash-joiner.py**
 
@@ -385,6 +429,11 @@ here fails CI.
 | `--user-pass` | Emit 'username:plaintext'. Needs a dcsync-style input line. |
 | `--only-cracked` | Omit uncracked entries instead of emitting <HASH_NOT_FOUND>. |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
+| `--min-length N` | Drop candidates shorter than N characters before writing them. |
+| `--max-length N` | Drop candidates longer than N characters before writing them. |
+| `--skip N` | Skip the first N candidates, like hashcat's -s. Use with --limit to split one job across machines. |
+| `--limit N` | Stop after writing N candidates, like hashcat's -l. |
+| `--gzip` | Write a gzip stream. hashcat 6.2.4+ reads gzipped wordlists directly. Implied by a .gz output path. |
 
 ### dictionary-manipulation/
 
@@ -407,7 +456,7 @@ here fails CI.
 | `-i, --input INPUT` | Input file. Defaults to stdin. |
 | `--known-out KNOWN_OUT` | File for the extracted dictionary words (default: known_words.txt). |
 | `--remaining-out REMAINING_OUT` | File for everything left over (default: remaining_text.txt). |
-| `--custom-dict, --custom_dict CUSTOM_DICT` | Reference word list, instead of the NLTK corpus. |
+| `--custom-dict, --custom_dict CUSTOM_DICT` | Reference word list. Without it the NLTK corpus is used, falling back to the system word list. |
 | `--min-word-length N` | Shortest substring treated as a word (default: 4). Lower values match far more aggressively and produce noisier output. |
 | `--no-sort` | Leave output in input order instead of sorting and deduplicating. |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
@@ -418,7 +467,7 @@ here fails CI.
 |---|---|
 | `-i, --input INPUT` | Input file. Defaults to stdin. |
 | `-o, --output OUTPUT` | Output file. Defaults to stdout. |
-| `--custom-dict, --custom_dict CUSTOM_DICT` | Reference word list to compare against, instead of the NLTK corpus. |
+| `--custom-dict, --custom_dict CUSTOM_DICT` | Reference word list to compare against. Without it the NLTK corpus is used, falling back to the system word list. |
 | `--invert` | Emit the words that ARE in the dictionary rather than the ones that are not. |
 | `--split-words` | Treat each whitespace-separated token as a word. By default a whole line is one word, which is what you want for a password list. |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |

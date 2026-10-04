@@ -243,6 +243,200 @@ def test_statistics_never_reach_stdout():
 
 
 # --------------------------------------------------------------------------
+# Candidate stream: chunking, filtering, slicing, compression
+# --------------------------------------------------------------------------
+
+class TestCandidateStream:
+    def test_writer_filters_slices_and_chunks(self):
+        import io
+
+        from wordlistlib.cli import CandidateWriter
+
+        handle = io.StringIO()
+        writer = CandidateWriter(
+            handle, chunk_size=3, min_length=2, max_length=4, skip=1, limit=3
+        )
+        writer.feed(["a", "bb", "ccc", "dddd", "eeeee", "ff", "gg", "hh"])
+        writer.close()
+        assert handle.getvalue() == "ccc\ndddd\nff\n"
+        assert (writer.written, writer.filtered, writer.skipped) == (3, 2, 1)
+
+    def test_writer_stops_consuming_at_limit(self):
+        """--limit must stop generation, not just stop writing."""
+        import io
+
+        from wordlistlib.cli import CandidateWriter
+
+        consumed = []
+
+        def endless():
+            for i in range(1_000_000):
+                consumed.append(i)
+                yield str(i)
+
+        writer = CandidateWriter(io.StringIO(), chunk_size=4, limit=10)
+        writer.feed(endless())
+        writer.close()
+        assert writer.written == 10
+        assert len(consumed) == 10, f"generator over-consumed: {len(consumed)}"
+
+    def test_skip_and_limit_partition_the_stream(self):
+        """Two slices must reconstruct the whole, with no gap or overlap."""
+        whole = run(REPO / "keyboard-walk.py", "-l", "3", "-q", "--force").stdout.splitlines()
+        first = run(REPO / "keyboard-walk.py", "-l", "3", "-q", "--force",
+                    "--limit", "500").stdout.splitlines()
+        second = run(REPO / "keyboard-walk.py", "-l", "3", "-q", "--force",
+                     "--skip", "500").stdout.splitlines()
+        assert first + second == whole
+
+    def test_length_filtering(self):
+        result = run(REPO / "multiple-words-joiner.py", "-i", "a,bbbb",
+                     "--min-words", "1", "--max-length", "2", "-q", "--force")
+        assert result.stdout == "a\n"
+
+    def test_gzip_round_trip(self, tmp_path):
+        import gzip
+
+        out = tmp_path / "walks.txt.gz"
+        run(REPO / "keyboard-walk.py", "-l", "2", "-q", "--force", "-o", str(out))
+        with gzip.open(out, "rt") as handle:
+            compressed = handle.read().splitlines()
+        plain = run(REPO / "keyboard-walk.py", "-l", "2", "-q", "--force").stdout.splitlines()
+        assert compressed == plain
+
+    def test_gzip_input_is_read_transparently(self, tmp_path):
+        import gzip
+
+        src = tmp_path / "words.txt.gz"
+        with gzip.open(src, "wt") as handle:
+            handle.write("abc\n")
+        result = run(REPO / "swapcase.py", "-i", str(src), "-q")
+        assert result.stdout == "ABC\n"
+
+
+# --------------------------------------------------------------------------
+# Optimisations must not change what is emitted
+# --------------------------------------------------------------------------
+
+class TestOptimisationsPreserveOutput:
+    """The generators were restructured for speed; order and content are pinned."""
+
+    def test_case_permutation_matches_plain_product(self):
+        import itertools
+
+        for word in ("abc", "pa55w0rd!", "Mega Corp", "abcdefghijklmnopqrstu"):
+            expected = [
+                "".join(combo)
+                for combo in itertools.product(*(caseperm.char_variants(c) for c in word))
+            ]
+            assert list(caseperm.permutations(word)) == expected, word
+
+    def test_non_binding_max_upper_matches_unrestricted(self):
+        word = "megacorp"
+        cased = sum(1 for c in word if c.lower() != c.upper())
+        assert list(caseperm.permutations(word, cased)) == list(caseperm.permutations(word))
+
+    def test_keyboard_walk_pinned_order(self):
+        module = load(REPO / "keyboard-walk.py")
+        adjacency = module.build_adjacency(module.LAYOUTS["qwerty"])
+        walks = list(module.walks(adjacency, 2))
+        assert walks[:4] == ["`1", "`q", "`w", "1`"]
+        assert len(walks) == module.count_walks(adjacency, 2)
+
+    def test_leetspeak_pinned_order(self):
+        module = load(REPO / "leetspeak-generator.py")
+        positions = module.positions_for("ab", module.build_table(3))
+        assert list(module.generate(positions, 1)) == [
+            "ab", "aB", "a8", "Ab", "AB", "A8", "4b", "4B", "@b", "@B",
+        ]
+
+
+# --------------------------------------------------------------------------
+# hashcat rule output
+# --------------------------------------------------------------------------
+
+def apply_rule(rule: str, word: str) -> str:
+    """Minimal hashcat rule interpreter covering the functions we emit."""
+    i = 0
+    while i < len(rule):
+        op = rule[i]
+        if op == ":":
+            i += 1
+        elif op == "l":
+            word = word.lower()
+            i += 1
+        elif op == "u":
+            word = word.upper()
+            i += 1
+        elif op == "c":
+            word = word.capitalize()
+            i += 1
+        elif op == "t":
+            word = word.swapcase()
+            i += 1
+        elif op == "T":
+            pos = int(rule[i + 1], 36)
+            if pos < len(word):
+                word = word[:pos] + word[pos].swapcase() + word[pos + 1:]
+            i += 2
+        elif op == "s":
+            word = word.replace(rule[i + 1], rule[i + 2])
+            i += 3
+        else:
+            raise AssertionError(f"unhandled rule function {op!r} in {rule!r}")
+    return word
+
+
+class TestRuleOutput:
+    def test_toggle_rules_reproduce_the_wordlist(self):
+        word = "megacorp"
+        rules = list(caseperm.toggle_rules(len(word)))
+        produced = sorted(apply_rule(r, "MeGaCorp") for r in rules)
+        assert produced == sorted(caseperm.permutations(word))
+
+    def test_toggle_rules_respect_max_upper(self):
+        assert list(caseperm.toggle_rules(4, 1)) == ["l", "lT0", "lT1", "lT2", "lT3"]
+        for positions in (1, 5, 8):
+            for cap in (None, 0, 1, 2):
+                assert caseperm.count_toggle_rules(positions, cap) == \
+                    len(list(caseperm.toggle_rules(positions, cap)))
+
+    def test_toggle_rules_stay_within_hashcat_limits(self):
+        for rule in caseperm.toggle_rules(12, 3):
+            functions = 1 + rule.count("T")
+            assert functions <= caseperm.MAX_RULE_FUNCTIONS
+
+    def test_rules_refuse_unaddressable_positions(self):
+        with pytest.raises(ValueError):
+            list(caseperm.toggle_rules(caseperm.MAX_RULE_POSITION + 1))
+
+    def test_substitution_rules_are_a_subset_of_the_wordlist(self):
+        module = load(REPO / "leetspeak-generator.py")
+        table = module.build_table(1)
+        usable, _ = module.rule_substitutions(table, "banana")
+        rules = list(module.substitution_rules(usable, None))
+        from_rules = {apply_rule(r, "banana") for r in rules}
+        positions = module.positions_for("banana", table)
+        wordlist = set(module.generate(positions, None))
+        assert from_rules <= wordlist
+        assert "b4nana" in wordlist and "b4nana" not in from_rules
+
+    def test_substitution_rule_count_is_exact(self):
+        module = load(REPO / "leetspeak-generator.py")
+        for level in (1, 2):
+            usable, _ = module.rule_substitutions(module.build_table(level), "megacorp")
+            for cap in (None, 1, 2):
+                assert module.count_substitution_rules(usable, cap) == \
+                    len(list(module.substitution_rules(usable, cap)))
+
+    def test_multi_character_substitutions_are_reported_not_emitted(self):
+        module = load(REPO / "leetspeak-generator.py")
+        usable, dropped = module.rule_substitutions(module.build_table(3), "mud")
+        assert dropped, "level 3 has multi-character forms that must be reported"
+        assert all(len(sub) == 1 for subs in usable.values() for sub in subs)
+
+
+# --------------------------------------------------------------------------
 # Documentation
 # --------------------------------------------------------------------------
 
@@ -271,13 +465,21 @@ class TestDocumentation:
         readme = (REPO / "README.md").read_text()
         assert script.name in readme, f"{script.name} is not mentioned in README.md"
 
-    def test_readme_refers_to_no_renamed_files(self):
-        """The old names were removed; nothing should still point at them."""
+    def test_readme_examples_use_no_renamed_files(self):
+        """No command example may invoke a file that no longer exists.
+
+        The old names are allowed in prose -- the "Changes from earlier
+        versions" section lists them on purpose -- but not in a shell block
+        someone might copy and run.
+        """
+        import re
+
         readme = (REPO / "README.md").read_text()
         stale = [
             "keyboard_walk.py", "Multiple-Words-Joiner.py", "dict_compare.py",
             "rules_generator.py", "extract_strings.py", "extract_strings-v0.py",
             "longer-strings.py", "short-strings.py", "Dictionary Manipulation",
         ]
-        found = [name for name in stale if name in readme]
-        assert not found, f"README.md still refers to removed files: {found}"
+        blocks = re.findall(r"```sh\n(.*?)```", readme, re.S)
+        found = sorted({name for block in blocks for name in stale if name in block})
+        assert not found, f"README examples still invoke removed files: {found}"

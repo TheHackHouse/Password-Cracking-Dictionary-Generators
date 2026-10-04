@@ -95,11 +95,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "-p", "--prepend", default="",
-        help="Static string placed at the start of each candidate.",
+        help="Static string placed at the start of each candidate. It is "
+             "separated from the first word by --delimiter; use "
+             "--no-affix-delimiter to butt it straight up against the word.",
     )
     parser.add_argument(
         "-a", "--append", default="",
-        help="Static string placed at the end of each candidate.",
+        help="Static string placed at the end of each candidate, separated "
+             "from the last word by --delimiter.",
+    )
+    parser.add_argument(
+        "--no-affix-delimiter", action="store_true",
+        help="Concatenate --prepend and --append directly, with no delimiter "
+             "between them and the words.",
     )
     parser.add_argument(
         "--min-words", type=int, default=None, metavar="N",
@@ -115,6 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
                           f"(default {estimate.DEFAULT_MAX_CANDIDATES:,}).",
     )
     cli.add_common_args(parser)
+    cli.add_output_args(parser)
     return parser
 
 
@@ -160,6 +169,10 @@ def main() -> None:
         cli.die("provide either -i/--input or at least one -d/--dict")
 
     affix = len(args.prepend) + len(args.append)
+    if not args.no_affix_delimiter:
+        affix += len(args.delimiter) * bool(args.prepend)
+        affix += len(args.delimiter) * bool(args.append)
+    total = cli.sliced_total(total, args)
     estimate.confirm_or_exit(
         total,
         avg_length=avg_length + affix,
@@ -168,14 +181,29 @@ def main() -> None:
         label="combinations",
     )
 
-    written = 0
-    with cli.open_output(args.output) as out:
+    def rendered():
+        delimiter, prepend, append = args.delimiter, args.prepend, args.append
+        plain = args.no_affix_delimiter
         for combo in combinations:
-            out.write(args.prepend + args.delimiter.join(combo) + args.append + "\n")
-            written += 1
+            parts = list(combo)
+            if plain:
+                yield prepend + delimiter.join(parts) + append
+            else:
+                # The affixes join like any other word, so `-p corp -D -`
+                # gives corp-mega-2025 rather than corpmega-2025.
+                if prepend:
+                    parts.insert(0, prepend)
+                if append:
+                    parts.append(append)
+                yield delimiter.join(parts)
 
-    if args.output:
-        cli.log(f"Wrote {written:,} combinations to {args.output}")
+    with cli.open_output(args.output, compress=args.gzip) as out:
+        writer = cli.writer_for(out, args)
+        writer.feed(rendered())
+        writer.close()
+
+    cli.log(f"Combinations: {writer.report()}"
+            + (f" -> {args.output}" if args.output else ""))
 
 
 if __name__ == "__main__":

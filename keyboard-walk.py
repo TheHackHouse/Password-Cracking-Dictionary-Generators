@@ -117,22 +117,29 @@ def count_walks(adjacency: dict[str, list[str]], length: int) -> int:
 
 
 def walks(adjacency: dict[str, list[str]], length: int):
-    """Yield every walk of ``length`` keys. Memory is O(length), not O(output)."""
+    """Yield every walk of ``length`` keys. Memory is O(length), not O(output).
+
+    The final step is handled inside the loop rather than by another level of
+    recursion, and the path is carried as a string rather than a list that
+    has to be joined at each leaf. Emission order is unchanged.
+    """
     if length <= 0:
         return
-    acc: list[str] = []
+    if length == 1:
+        yield from adjacency
+        return
 
-    def step(key: str, remaining: int):
-        acc.append(key)
-        if remaining == 0:
-            yield "".join(acc)
-        else:
-            for neighbour in adjacency[key]:
-                yield from step(neighbour, remaining - 1)
-        acc.pop()
+    def step(prefix: str, key: str, remaining: int):
+        neighbours = adjacency[key]
+        if remaining == 1:
+            for neighbour in neighbours:
+                yield prefix + neighbour
+            return
+        for neighbour in neighbours:
+            yield from step(prefix + neighbour, neighbour, remaining - 1)
 
     for key in adjacency:
-        yield from step(key, length - 1)
+        yield from step(key, key, length - 1)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -157,6 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
                           f"(default {estimate.DEFAULT_MAX_CANDIDATES:,}).",
     )
     cli.add_common_args(parser)
+    cli.add_output_args(parser)
     return parser
 
 
@@ -171,7 +179,7 @@ def main() -> None:
     validate_layout(args.layout, rows)
     adjacency = build_adjacency(rows)
 
-    total = count_walks(adjacency, args.length)
+    total = cli.sliced_total(count_walks(adjacency, args.length), args)
     estimate.confirm_or_exit(
         total,
         avg_length=args.length,
@@ -180,14 +188,13 @@ def main() -> None:
         label="walks",
     )
 
-    written = 0
-    with cli.open_output(args.output) as out:
-        for walk in walks(adjacency, args.length):
-            out.write(walk + "\n")
-            written += 1
+    with cli.open_output(args.output, compress=args.gzip) as out:
+        writer = cli.writer_for(out, args)
+        writer.feed(walks(adjacency, args.length))
+        writer.close()
 
-    if args.output:
-        cli.log(f"Wrote {written:,} walks to {args.output}")
+    cli.log(f"Walks: {writer.report()}"
+            + (f" -> {args.output}" if args.output else ""))
 
 
 if __name__ == "__main__":

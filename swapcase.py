@@ -60,6 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
              "other (e.g. two inputs that upper-case to the same string).",
     )
     cli.add_common_args(parser, force=False)
+    cli.add_output_args(parser)
     return parser
 
 
@@ -68,20 +69,26 @@ def main() -> None:
     cli.set_quiet(args.quiet)
     transform = MODES[args.mode]
 
-    read = written = 0
-    seen: set[str] = set()
-    with cli.open_input(args.input) as infile, cli.open_output(args.output) as outfile:
-        for line in cli.iter_lines(infile):
-            read += 1
+    stats = {"read": 0}
+
+    def transformed(handle):
+        seen: set[str] = set()
+        for line in cli.iter_lines(handle):
+            stats["read"] += 1
             candidate = transform(line)
             if not args.keep_duplicates:
                 if candidate in seen:
                     continue
                 seen.add(candidate)
-            outfile.write(candidate + "\n")
-            written += 1
+            yield candidate
 
-    cli.log(f"Read {read:,} words, wrote {written:,} with mode '{args.mode}'.")
+    with cli.open_input(args.input) as infile, \
+            cli.open_output(args.output, compress=args.gzip) as outfile:
+        writer = cli.writer_for(outfile, args)
+        writer.feed(transformed(infile))
+        writer.close()
+
+    cli.log(f"Read {stats['read']:,} words with mode '{args.mode}': {writer.report()}.")
 
 
 if __name__ == "__main__":

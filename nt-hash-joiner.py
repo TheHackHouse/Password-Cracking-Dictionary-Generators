@@ -176,6 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Omit uncracked entries instead of emitting {NOT_FOUND}.",
     )
     cli.add_common_args(parser, force=False)
+    cli.add_output_args(parser)
     return parser
 
 
@@ -185,14 +186,13 @@ def main() -> None:
 
     pot = load_pot_file(args.pot_file)
 
-    written = 0
-    with cli.open_output(args.output) as out:
-        for line in process(args.hash_file, pot, args):
-            out.write(line + "\n")
-            written += 1
+    with cli.open_output(args.output, compress=args.gzip) as out:
+        writer = cli.writer_for(out, args)
+        writer.feed(process(args.hash_file, pot, args))
+        writer.close()
 
-    if args.output:
-        cli.log(f"Wrote {written:,} lines to {args.output}")
+    cli.log(f"Output: {writer.report()}"
+            + (f" -> {args.output}" if args.output else ""))
 
 
 if __name__ == "__main__":
