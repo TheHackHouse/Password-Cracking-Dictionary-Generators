@@ -32,6 +32,10 @@ from wordlistlib import caseperm, cli  # noqa: E402
 
 #: LM hash of an empty 7-character half. Resolves to "", not a failed lookup.
 BLANK_HALF = "AAD3B435B51404EE"
+#: Both halves empty. Windows stores this whenever it has no LM hash to
+#: store -- LM disabled (the default since Vista) or a password longer than
+#: 14 characters -- so it says nothing about the password and is skipped.
+BLANK_LM = BLANK_HALF * 2
 NOT_FOUND = "<HASH_NOT_FOUND>"
 
 HEX16 = re.compile(r"^[0-9A-F]{16}$")
@@ -42,11 +46,13 @@ def load_pot_file(pot_file: str) -> dict[str, str]:
     """Load ``LM_HASH_HALF:PLAINTEXT`` lines into a lookup table.
 
     Accepts hashcat's bare ``<16 hex>:<plain>`` and John's ``$LM$<16 hex>:<plain>``.
+    Only the line ending is removed, so a plaintext that begins or ends with
+    a space keeps it, and hashcat's ``$HEX[...]`` plaintexts are decoded.
     """
     pot: dict[str, str] = {}
     skipped = 0
     with cli.open_input(pot_file) as handle:
-        for line in cli.iter_lines(handle):
+        for line in cli.iter_lines(handle, strip=False):
             if line.startswith("$LM$"):
                 line = line[len("$LM$"):]
             half, sep, plaintext = line.partition(":")
@@ -55,7 +61,7 @@ def load_pot_file(pot_file: str) -> dict[str, str]:
                 continue
             half = half.strip().upper()
             if HEX16.match(half):
-                pot[half] = plaintext
+                pot[half] = cli.decode_pot_plaintext(plaintext)
             else:
                 skipped += 1
     if skipped:
@@ -64,6 +70,26 @@ def load_pot_file(pot_file: str) -> dict[str, str]:
         cli.die(f"{pot_file} contained no usable LM half-hash entries")
     cli.log(f"Loaded {len(pot):,} cracked LM halves from {pot_file}")
     return pot
+
+
+def find_lm_hash(line: str) -> str | None:
+    """Pull the LM hash out of a line.
+
+    Returns the 32 hex characters, ``""`` when the line is a dump entry whose
+    LM field holds no hash (``NO PASSWORD*****``, or empty), and ``None``
+    when the line is not recognisable at all.
+
+    In ``user:rid:LM:NT:::`` the LM hash is always the third field. Taking
+    "the first field that looks like a hash" would pick up the NT hash
+    whenever the LM field is a placeholder.
+    """
+    candidate = line.upper()
+    if HEX32.match(candidate):
+        return candidate
+    fields = [field.strip() for field in candidate.split(":")]
+    if len(fields) >= 4 and (HEX32.match(fields[2]) or HEX32.match(fields[3])):
+        return fields[2] if HEX32.match(fields[2]) else ""
+    return next((field for field in fields if HEX32.match(field)), None)
 
 
 def resolve(half: str, pot: dict[str, str]) -> tuple[str, bool]:
@@ -77,20 +103,21 @@ def resolve(half: str, pot: dict[str, str]) -> tuple[str, bool]:
 
 def process(hash_file: str, pot: dict[str, str], args):
     """Yield output lines, streaming rather than buffering the whole result."""
-    stats = {"lines": 0, "skipped": 0, "complete": 0, "partial": 0, "missing": 0}
+    stats = {"lines": 0, "skipped": 0, "no_lm": 0,
+             "complete": 0, "partial": 0, "missing": 0}
 
     with cli.open_input(hash_file) as handle:
         for line in cli.iter_lines(handle):
-            # Tolerate `user:rid:LMHASH:NTHASH:::` as well as a bare LM hash.
-            candidate = line.upper()
-            if not HEX32.match(candidate):
-                fields = [f.strip().upper() for f in candidate.split(":")]
-                candidate = next((f for f in fields if HEX32.match(f)), "")
-            if not HEX32.match(candidate):
+            candidate = find_lm_hash(line)
+            if candidate is None:
                 stats["skipped"] += 1
                 continue
 
             stats["lines"] += 1
+            if candidate in ("", BLANK_LM):
+                stats["no_lm"] += 1
+                continue
+
             first, second = candidate[:16], candidate[16:]
             plain_first, found_first = resolve(first, pot)
             plain_second, found_second = resolve(second, pot)
@@ -107,19 +134,24 @@ def process(hash_file: str, pot: dict[str, str], args):
                 continue
 
             if args.permute_case and found_first and found_second:
-                for variant in caseperm.permutations(password, args.max_upper):
-                    yield f"{candidate}:{variant}" if args.full else variant
+                if args.full:
+                    prefix = candidate + ":"
+                    yield from map(prefix.__add__,
+                                   caseperm.permutations(password, args.max_upper))
+                else:
+                    yield from caseperm.permutations(password, args.max_upper)
             else:
                 yield f"{candidate}:{password}" if args.full else password
 
     cli.log(
-        f"Read {stats['lines']:,} LM hashes "
+        f"Read {stats['lines']:,} entries "
         f"({stats['skipped']:,} unparseable lines skipped)"
     )
     cli.log(
         f"Fully recovered: {stats['complete']:,} | "
         f"partially recovered: {stats['partial']:,} | "
-        f"not cracked: {stats['missing']:,}"
+        f"not cracked: {stats['missing']:,} | "
+        f"no LM hash stored: {stats['no_lm']:,}"
     )
 
 
@@ -165,6 +197,11 @@ def build_parser() -> argparse.ArgumentParser:
              "candidate. Strongly recommended: without it a 14-character "
              "password expands to 16,384 candidates.",
     )
+    parser.add_argument(
+        "--unique", action="store_true",
+        help="Write each distinct line once. Accounts that share a password "
+             "otherwise repeat it. Holds the distinct lines in memory.",
+    )
     cli.add_common_args(parser, force=False)
     cli.add_output_args(parser)
     return parser
@@ -181,9 +218,13 @@ def main() -> None:
 
     pot = load_pot_file(args.pot_file)
 
+    results = process(args.hash_file, pot, args)
+    if args.unique:
+        results = cli.unique(results)
+
     with cli.open_output(args.output, compress=args.gzip) as out:
         writer = cli.writer_for(out, args)
-        writer.feed(process(args.hash_file, pot, args))
+        writer.feed(results)
         writer.close()
 
     cli.log(f"Output: {writer.report()}"
@@ -191,4 +232,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

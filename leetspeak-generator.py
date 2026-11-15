@@ -110,27 +110,48 @@ def count_and_size(positions, max_subs: int | None) -> tuple[int, int]:
     return count, lengths[budget] + count  # + one newline per candidate
 
 
+#: Largest block of ready-made endings kept per substitution budget. The last
+#: few positions are expanded once into such a block and glued onto every
+#: prefix, so most of the output costs one C-level concatenation each.
+TAIL_LIMIT = 4096
+
+
 def generate(positions, max_subs: int | None):
     """Yield every candidate, lazily, respecting the substitution budget.
 
-    The candidate is carried down as a string and the last position is
-    expanded inside the loop, rather than recursing once more and joining an
-    accumulator list at every leaf. Emission order is unchanged.
+    The search recurses over the leading positions only. The trailing ones
+    are expanded up front, once per remaining budget, into lists of endings
+    (at most :data:`TAIL_LIMIT` each) that are appended to each prefix.
+    Emission order is the same as a position-by-position recursion: plain
+    forms before substitutions, leftmost position varying slowest.
     """
     if not positions:
         return
-    budget = len(positions) if max_subs is None else max_subs
-    last = len(positions) - 1
+    count = len(positions)
+    budget = count if max_subs is None else min(max_subs, count)
+
+    # tails[b]: every ending from position ``split`` on with b substitutions
+    # still allowed. Grown backwards until the next step would be too big.
+    tails = [[""] for _ in range(budget + 1)]
+    split = count
+    while split > 0:
+        plain, subs = positions[split - 1]
+        grown = []
+        for b in range(budget + 1):
+            block = [option + rest for option in plain for rest in tails[b]]
+            if b > 0:
+                block += [option + rest for option in subs for rest in tails[b - 1]]
+            grown.append(block)
+        if len(grown[budget]) > TAIL_LIMIT and split < count:
+            break
+        tails = grown
+        split -= 1
 
     def walk(index: int, prefix: str, remaining: int):
-        plain, subs = positions[index]
-        if index == last:
-            for option in plain:
-                yield prefix + option
-            if remaining > 0:
-                for option in subs:
-                    yield prefix + option
+        if index == split:
+            yield from map(prefix.__add__, tails[remaining])
             return
+        plain, subs = positions[index]
         for option in plain:
             yield from walk(index + 1, prefix + option, remaining)
         if remaining > 0:
@@ -204,14 +225,14 @@ def substitution_rules(usable: dict[str, list[str]], max_subs: int | None):
     yield from walk(0, "", budget)
 
 
-def emit_rules(args, table) -> None:
-    usable, dropped = rule_substitutions(table, args.input)
+def emit_rules(args, table, phrase: str | None) -> None:
+    usable, dropped = rule_substitutions(table, phrase)
     if dropped:
         cli.warn(
             f"{len(dropped)} multi-character substitution(s) cannot be expressed "
             f"as hashcat rules and were skipped: {' '.join(sorted(set(dropped)))}"
         )
-    if " " in (args.input or ""):
+    if " " in (phrase or ""):
         cli.warn("space separators cannot be expressed as rules and were skipped")
     if not usable:
         cli.die("no rule-expressible substitutions at this level")
@@ -269,8 +290,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--rules", action="store_true",
         help="Emit a hashcat .rule file of sXY substitutions instead of a "
              "wordlist, so the substitutions apply to a whole dictionary "
-             "rather than one phrase. Multi-character substitutions are not "
-             "expressible as rules and are skipped.",
+             "rather than one phrase. With a phrase (-i or stdin) only its "
+             "letters are covered; without one, every letter is. "
+             "Multi-character substitutions are not expressible as rules "
+             "and are skipped.",
     )
     parser.add_argument(
         "--no-case", action="store_true",
@@ -295,21 +318,22 @@ def main() -> None:
 
     if args.input is not None:
         phrase = args.input.strip()
-    elif sys.stdin.isatty():
-        try:
-            phrase = input("Enter input phrase: ").strip()
-        except EOFError:
-            phrase = ""
+    elif not sys.stdin.isatty():
+        phrase = cli.stdin().read().strip()
+    elif args.rules:
+        phrase = ""               # rules need no phrase: cover every letter
     else:
-        phrase = sys.stdin.read().strip()
-    if not phrase:
-        cli.die("no input provided")
+        phrase = cli.prompt("Enter input phrase: ")
 
     table = build_table(args.level, keep_case=not args.no_case)
 
     if args.rules:
-        emit_rules(args, table)
+        # With a phrase the rules cover its letters; without one, all letters.
+        emit_rules(args, table, phrase or None)
         return
+
+    if not phrase:
+        cli.die("no input provided")
 
     positions = positions_for(phrase, table)
     total, exact_bytes = count_and_size(positions, args.max_subs)
@@ -332,4 +356,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

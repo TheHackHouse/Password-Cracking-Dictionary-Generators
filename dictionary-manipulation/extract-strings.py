@@ -14,6 +14,7 @@ two-category behaviour of the older pair is `--categories letters,specials`.
 from __future__ import annotations
 
 import argparse
+import itertools
 import re
 import sys
 from pathlib import Path
@@ -29,7 +30,9 @@ from wordlistlib import cli  # noqa: E402
 CATEGORIES = ("letters", "short_letters", "numbers", "specials")
 DEFAULT_CATEGORIES = ",".join(CATEGORIES)
 
-ASCII_SPLIT = re.compile(r"[a-zA-Z]+|\d+|[^a-zA-Z\d]+")
+# [0-9], not \d: \d also matches non-ASCII digits, which classify() then
+# files under specials because they are not ASCII.
+ASCII_SPLIT = re.compile(r"[a-zA-Z]+|[0-9]+|[^a-zA-Z0-9]+")
 
 
 def split_sequences(line: str, unicode_mode: bool):
@@ -69,6 +72,51 @@ def classify(seq: str, short_letters_enabled: bool, unicode_mode: bool) -> str |
     if is_digit:
         return "numbers"
     return "specials"
+
+
+LETTER_RUNS = re.compile(r"[a-zA-Z]+")
+DIGIT_RUNS = re.compile(r"[0-9]+")
+SPECIAL_RUNS = re.compile(r"[^a-zA-Z0-9\n]+")
+
+
+def runs_by_category(lines: list[str], wanted, short_letters_enabled: bool,
+                     unicode_mode: bool) -> dict[str, list[str]]:
+    """Sort the runs of a block of lines into the ``wanted`` categories.
+
+    Each category's runs come back in input order, which is all that matters
+    since each goes to its own file.
+
+    The ASCII path joins the block and makes one regular-expression pass per
+    wanted category over it, instead of splitting and classifying run by
+    run: the lines are separated by ``\\n``, which no pattern matches, so a
+    run can never span two lines. It is several times faster and only does
+    the work for the categories that were asked for.
+    """
+    groups: dict[str, list[str]] = {name: [] for name in wanted}
+
+    if unicode_mode:
+        for line in lines:
+            for seq in split_sequences(line, True):
+                category = classify(seq, short_letters_enabled, True)
+                if category in groups:
+                    groups[category].append(seq)
+        return groups
+
+    block = "\n".join(lines)
+    if "letters" in groups or "short_letters" in groups:
+        runs = LETTER_RUNS.findall(block)
+        if short_letters_enabled:
+            if "short_letters" in groups:
+                groups["short_letters"] = [run for run in runs if len(run) <= 2]
+            if "letters" in groups:
+                groups["letters"] = [run for run in runs if len(run) > 2]
+        else:
+            groups["letters"] = runs
+    if "numbers" in groups:
+        groups["numbers"] = DIGIT_RUNS.findall(block)
+    if "specials" in groups:
+        groups["specials"] = SPECIAL_RUNS.findall(block)
+    return groups
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -138,26 +186,49 @@ def main() -> None:
 
     counts = dict.fromkeys(selected, 0)
     handles = {}
+    # Sorted output to stdout cannot be sorted in place afterwards the way a
+    # file is, so its distinct sequences are collected and written at the end.
+    collected: set[str] | None = None
+    writers = {}
     try:
         for name, path in targets.items():
+            if path == "-":
+                if args.no_sort:
+                    writers[name] = cli.stdout().write
+                else:
+                    collected = set()
+                continue
             try:
-                handles[name] = open(path, "w", encoding="utf-8", newline="\n") \
-                    if path != "-" else sys.stdout
+                handles[name] = cli.create_text_file(path)
             except OSError as exc:
                 cli.die(f"cannot write {path}: {exc}")
+            writers[name] = handles[name].write
 
         with cli.open_input(args.input) as infile:
-            for line in cli.iter_lines(infile, skip_empty=False):
-                for seq in split_sequences(line, args.unicode):
-                    category = classify(seq, short_enabled, args.unicode)
-                    if category in handles:
-                        handles[category].write(seq + "\n")
-                        counts[category] += 1
+            lines = cli.iter_lines(infile, skip_empty=False)
+            while True:
+                batch = list(itertools.islice(lines, cli.DEFAULT_CHUNK_SIZE))
+                if not batch:
+                    break
+                groups = runs_by_category(batch, selected, short_enabled, args.unicode)
+                for name, runs in groups.items():
+                    if not runs:
+                        continue
+                    counts[name] += len(runs)
+                    write = writers.get(name)
+                    if write is None:
+                        collected.update(runs)
+                    else:
+                        write("\n".join(runs))
+                        write("\n")
     finally:
         for handle in handles.values():
-            if handle is not sys.stdout:
-                handle.close()
+            handle.close()
 
+    if collected:
+        out = cli.stdout()
+        out.write("\n".join(sorted(collected)))
+        out.write("\n")
     if not args.no_sort:
         for path in targets.values():
             if path != "-":
@@ -168,4 +239,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

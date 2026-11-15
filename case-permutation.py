@@ -13,6 +13,7 @@ once) or --common (just the four or five forms people actually type).
 from __future__ import annotations
 
 import argparse
+import itertools
 import os
 import sys
 from pathlib import Path
@@ -85,26 +86,42 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def read_words(args) -> list[str]:
-    if args.word:
-        return [args.word]
+def word_source(args):
+    """Return a function that yields the input words afresh on each call.
+
+    The words are needed twice -- once to count the job, once to generate it
+    -- and a file is simply read twice rather than held in memory, so the
+    input can be far larger than RAM. Only stdin, which cannot be rewound,
+    is kept.
+    """
+    if args.word is not None:
+        if not args.word:
+            cli.die("-w/--word is empty")
+        return lambda: iter([args.word])
+
     if args.input is None and sys.stdin.isatty():
-        try:
-            word = input("Please enter the word: ").strip()
-        except EOFError:
-            word = ""
+        word = cli.prompt("Please enter the word: ")
         if not word:
             cli.die("no input provided")
-        return [word]
-    with cli.open_input(args.input) as handle:
-        words = list(cli.iter_lines(handle))
-    if not words:
-        cli.die("input contained no words")
-    return words
+        return lambda: iter([word])
+
+    if args.input in (None, "-"):
+        with cli.open_input(None) as handle:
+            words = list(cli.iter_lines(handle))
+        return lambda: iter(words)
+
+    def reread():
+        with cli.open_input(args.input) as handle:
+            yield from cli.iter_lines(handle)
+
+    return reread
 
 
 #: Name of the compiled twin, looked for next to this script.
 C_BINARY = "case-permutation"
+
+#: Longest word the compiled twin accepts (MAX_LENGTH in case-permutation.c).
+C_MAX_WORD_LENGTH = 63
 
 
 def try_compiled_binary(args) -> None:
@@ -112,12 +129,18 @@ def try_compiled_binary(args) -> None:
 
     The C build is roughly 4x faster and produces byte-identical output, so
     the handoff is invisible apart from one line on stderr. It only happens
-    for jobs C supports: a single -w word with no rule output, no gzip and
-    no candidate-stream slicing.
+    for jobs C supports: a single ASCII -w word of up to 63 characters, with
+    the default safety limit, no rule output, no gzip and no candidate-stream
+    slicing. C folds case a byte at a time, so anything outside ASCII would
+    come out differently.
     """
     if args.no_c or args.rules or args.common or not args.word:
         return
-    if args.gzip or args.skip or args.limit:
+    if not args.word.isascii() or len(args.word) > C_MAX_WORD_LENGTH:
+        return
+    if args.max_candidates != estimate.DEFAULT_MAX_CANDIDATES:
+        return
+    if args.gzip or args.skip or args.limit is not None:
         return
     if args.min_length or args.max_length is not None:
         return
@@ -165,8 +188,9 @@ def emit_rules(args) -> None:
         if args.positions is not None:
             positions = args.positions
         else:
-            words = read_words(args)
-            positions = max(len(word) for word in words)
+            positions = max(map(len, word_source(args)()), default=0)
+            if not positions:
+                cli.die("input contained no words")
             cli.log(f"Using {positions} positions (longest input word). "
                     f"Override with --positions.")
         if positions < 1:
@@ -213,13 +237,29 @@ def main() -> None:
 
     try_compiled_binary(args)         # replaces this process when it applies
 
-    words = read_words(args)
+    words = word_source(args)
 
+    # First pass: size the job, a block of words at a time so the arithmetic
+    # runs in C. Only one block is ever held, so memory does not grow with
+    # the input.
     if args.common:
-        total = sum(len(caseperm.common_forms(w)) for w in words)
+        count = caseperm.count_common_forms
     else:
-        total = sum(caseperm.count_permutations(w, args.max_upper) for w in words)
-    avg_length = sum(len(w) for w in words) / len(words)
+        def count(word):
+            return caseperm.count_permutations(word, args.max_upper)
+
+    total = word_count = length_sum = 0
+    source = words()
+    while True:
+        block = list(itertools.islice(source, cli.DEFAULT_CHUNK_SIZE))
+        if not block:
+            break
+        word_count += len(block)
+        length_sum += sum(map(len, block))
+        total += sum(map(count, block))
+    if not word_count:
+        cli.die("input contained no words")
+    avg_length = length_sum / word_count
 
     estimate.confirm_or_exit(
         cli.sliced_total(total, args),
@@ -229,16 +269,19 @@ def main() -> None:
         label="permutations",
     )
 
-    def candidates():
-        for word in words:
-            if args.common:
-                yield from caseperm.common_forms(word)
-            else:
-                yield from caseperm.permutations(word, args.max_upper)
+    if args.common:
+        expand = caseperm.iter_common_forms
+    else:
+        def expand(word):
+            return caseperm.permutations(word, args.max_upper)
+
+    # chain + map: each word's candidates flow straight into the writer with
+    # no generator frame of our own in between.
+    candidates = itertools.chain.from_iterable(map(expand, words()))
 
     with cli.open_output(args.output, compress=args.gzip) as out:
         writer = cli.writer_for(out, args)
-        writer.feed(candidates())
+        writer.feed(candidates)
         writer.close()
 
     cli.log(f"Permutations: {writer.report()}"
@@ -246,4 +289,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

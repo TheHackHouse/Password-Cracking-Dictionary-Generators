@@ -26,6 +26,22 @@ Every generator works out how many candidates it is about to produce *before*
 producing any, prints the count and the output size, and asks for confirmation
 past 50 million (`--max-candidates` to change, `--force` to skip).
 
+Output is UTF-8 with `\n` line endings on every platform, and `-o list.txt`
+and `> list.txt` produce the same bytes. Input bytes that are not valid UTF-8
+— most large real-world wordlists contain some — pass through unchanged.
+
+Wordlists are streamed: a list given with `-i` is read line by line and not
+held in memory, so it can be far larger than RAM (memory stays in the tens of
+megabytes on a multi-gigabyte input). The exceptions are the ones that have
+to remember what they have seen, each noted below: dropping duplicates
+(`swapcase.py` by default, `--unique` in the hash joiners), the second and
+later dictionaries of `multiple-words-joiner.py`, and the reference word list
+of the dictionary tools. `case-permutation.py` reads a file twice, once to
+size the job and once to generate, so words piped on stdin are kept instead.
+Sorting uses the system `sort -u` when there is one and an in-process
+external merge sort when there is not (plain Windows), neither of which
+needs the file to fit in memory.
+
 ## Install
 
 Nothing to install — they are standalone Python 3.10+ scripts that only need
@@ -107,8 +123,12 @@ keyboard-walk.py -l 6 -k qwertyshifted2 --force > walks6.txt
 Layouts: `qwerty`, `qwertyshifted`, `qwertyshifted1`, `qwertyshifted2`,
 `dvorak`, `azerty`.
 
-Walk counts grow about 6.6× per character on qwerty (length 4 is 11,900;
-length 6 is 515,362; length 8 is roughly 22 million), so check the reported
+Keys are neighbours when they touch on a grid in which the number row sits
+one key to the left of the letter rows — `1` above `q`, `2` above `w` — which
+is what makes `1q2w3e`, `1qaz` and `zaq1` all walks.
+
+Walk counts grow about 6.6× per character on qwerty (length 4 is 11,844;
+length 6 is 514,286; length 8 is roughly 22 million), so check the reported
 count before committing to a long run. The count is computed arithmetically
 and takes under a millisecond at any length.
 
@@ -129,7 +149,9 @@ multiple-words-joiner.py -d names.txt -d years.txt -D '-' -a '!' -o list.txt
 ```
 
 Repeat `-d` for as many dictionaries as you like. The first is streamed from
-disk rather than loaded into memory.
+disk and never held in memory, so put the big list first — it can be any
+size. The others are loaded. Because the first is not held, its duplicate
+lines are not removed; `sort -u` it beforehand if it has any.
 
 `--prepend` and `--append` are separated from the words by `--delimiter`, so
 `-p corp -D -` gives `corp-mega-2025`. Pass `--no-affix-delimiter` to butt
@@ -147,6 +169,10 @@ cat dictionary.txt | swapcase.py --mode title > titled.txt
 
 Modes: `swap` (default), `upper`, `lower`, `title`, `capitalize`. For *every*
 case combination rather than one transformation, use `case-permutation.py`.
+
+Duplicate outputs are dropped by default, which means remembering every
+distinct one. For a list larger than memory pass `--keep-duplicates`, which
+makes the run fully streaming, and `sort -u` the result.
 
 ---
 
@@ -169,10 +195,16 @@ match the corresponding NT hash as-is — `--permute-case` (or a separate run of
 expansion; without it a 14-character password becomes 16,384 candidates.
 
 `AAD3B435B51404EE` (an empty second half, i.e. a password under 8 characters)
-resolves to an empty string rather than being reported as uncracked.
+resolves to an empty string rather than being reported as uncracked. When
+*both* halves are that value there is no LM hash at all — LM storage is off,
+or the password is longer than 14 characters — so the entry is skipped and
+counted as "no LM hash stored" rather than emitted as an empty password.
 
 Accepts hashcat (`<16 hex>:<plain>`) and John (`$LM$<16 hex>:<plain>`) pot
-files, and picks the LM field out of dcsync-style lines.
+files, and picks the LM field (always the third) out of dcsync-style lines.
+hashcat's `$HEX[...]` plaintexts are decoded, and a plaintext's leading or
+trailing spaces are kept. `--unique` writes a password shared by several
+accounts once.
 
 ### nt-hash-joiner.py
 
@@ -189,11 +221,15 @@ nt-hash-joiner.py nt.pot domain.ntds --only-cracked > wordlist.txt
 | `--user-pass` | `username:plaintext` — the reporting format |
 | `--full` | the original line with the NT hash replaced |
 | `--only-cracked` | drop entries that are not in the pot file |
+| `--unique` | write each distinct line once |
 
 Input lines are recognised by shape, so real `secretsdump.py` / NTDS output
-(`user:rid:lmhash:nthash:::`) works, as does a file of bare 32-character
-hashes. `31D6CFE0...` is reported as `<BLANK_PASSWORD>` rather than as
-uncracked, and is kept out of plain wordlist output.
+(`user:rid:lmhash:nthash:::`) works, as do `user:hash` lines (what
+`hashcat --username` takes) and a file of bare 32-character hashes.
+`31D6CFE0...` is reported as `<BLANK_PASSWORD>` rather than as uncracked, and
+is kept out of plain wordlist output. hashcat's `$HEX[...]` plaintexts are
+decoded, so a report shows the password rather than its hex, and a
+plaintext's leading or trailing spaces are kept.
 
 ---
 
@@ -226,8 +262,10 @@ dict-extractor.py -i cracked.txt --known-out words.txt --remaining-out rest.txt
 dict-extractor.py -i cracked.txt --custom-dict english.txt --min-word-length 5
 ```
 
-The matcher prefers the longest word but backtracks when the remainder cannot
-be split.
+The matcher picks the split that covers the most characters with dictionary
+words, using as few words as it can. Whatever no word accounts for is stepped
+over rather than spoiling the match, and each such stretch is written to the
+leftovers on its own line.
 
 ### dict-compare.py
 
@@ -262,10 +300,16 @@ hashcat -m 1000 hashes.txt base.txt -r corp.rule
 ```
 
 hashcat's `^X` *prepends* and rule functions run left to right, so the prefix
-rule for `corp` is `^p^r^o^c`. Strings containing whitespace or `#` cannot be
-expressed as rule operands and are skipped with a warning
-(`--allow-unsafe` to emit them anyway); strings longer than `--max-functions`
-(default 31) are skipped because hashcat rejects the resulting rule.
+rule for `corp` is `^p^r^o^c`.
+
+Any printable ASCII character can be an operand, including `#` (only a line
+*starting* with `#` is a comment) and the space (hashcat ignores whitespace
+"unless it is used as a parameter"), so `acme corp` and `#1` both work.
+Tabs, control characters and anything outside ASCII can only be written as
+`\xNN` hex bytes; strings containing them are skipped with a warning unless
+`--hex-escape` is given, because that syntax needs a recent hashcat. Strings
+needing more than `--max-functions` functions (default 31) are skipped
+because hashcat rejects the resulting rule.
 
 ---
 
@@ -317,7 +361,7 @@ here fails CI.
 | `-o, --output OUTPUT` | Output file. Defaults to stdout. |
 | `-l, --level {1,2,3}` | Substitution level: 1 digits, 2 +symbols, 3 +multi-character (default: 2). |
 | `-m, --max-subs N` | Substitute at most N characters per candidate. Spaces do not count. Without this, every substitutable character is swapped in every combination. |
-| `--rules` | Emit a hashcat .rule file of sXY substitutions instead of a wordlist, so the substitutions apply to a whole dictionary rather than one phrase. Multi-character substitutions are not expressible as rules and are skipped. |
+| `--rules` | Emit a hashcat .rule file of sXY substitutions instead of a wordlist, so the substitutions apply to a whole dictionary rather than one phrase. With a phrase (-i or stdin) only its letters are covered; without one, every letter is. Multi-character substitutions are not expressible as rules and are skipped. |
 | `--no-case` | Do not also vary upper/lower case (substitutions only). |
 | `--max-candidates N` | Safety limit before --force is required (default 50,000,000). |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
@@ -370,13 +414,13 @@ here fails CI.
 | option | description |
 |---|---|
 | `-i, --input INPUT` | Comma separated list of words, e.g. 'cat,bird,dog'. |
-| `-d, --dict FILE` | Dictionary file, one word per line. Repeat for each dictionary. |
+| `-d, --dict FILE` | Dictionary file, one word per line. Repeat for each dictionary. The first is streamed and may be any size (its duplicate lines are not removed); the others are loaded into memory. |
 | `-o, --output OUTPUT` | Output file. Defaults to stdout. |
 | `-D, --delimiter DELIMITER` | String placed between words (default: none). |
 | `-p, --prepend PREPEND` | Static string placed at the start of each candidate. It is separated from the first word by --delimiter; use --no-affix-delimiter to butt it straight up against the word. |
 | `-a, --append APPEND` | Static string placed at the end of each candidate, separated from the last word by --delimiter. |
 | `--no-affix-delimiter` | Concatenate --prepend and --append directly, with no delimiter between them and the words. |
-| `--min-words N` | With -i, the fewest words per candidate (default: all of them). |
+| `--min-words N` | With -i, the fewest words per candidate (default: all of them, or 1 when --max-words is given). |
 | `--max-words N` | With -i, the most words per candidate (default: all of them). |
 | `--max-candidates N` | Safety limit before --force is required (default 50,000,000). |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
@@ -394,7 +438,7 @@ here fails CI.
 | `-i, --input INPUT` | Input file, one word per line. Defaults to stdin. |
 | `-o, --output OUTPUT` | Output file. Defaults to stdout. |
 | `-m, --mode {capitalize,lower,swap,title,upper}` | Transformation to apply (default: swap). |
-| `--keep-duplicates` | Do not drop candidates that are unchanged duplicates of each other (e.g. two inputs that upper-case to the same string). |
+| `--keep-duplicates` | Do not drop candidates that are duplicates of each other (e.g. two inputs that upper-case to the same string). Dropping them means remembering every distinct output, so use this for lists larger than memory and run sort -u afterwards. |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
 | `--min-length N` | Drop candidates shorter than N characters before writing them. |
 | `--max-length N` | Drop candidates longer than N characters before writing them. |
@@ -413,6 +457,7 @@ here fails CI.
 | `--only-cracked` | Omit entries where a half is missing, instead of emitting <HASH_NOT_FOUND>. |
 | `--permute-case` | Also emit case permutations of each recovered password. LM is case-insensitive, so this is what makes the output usable against the matching NT hashes. |
 | `-m, --max-upper N` | With --permute-case, uppercase at most N characters per candidate. Strongly recommended: without it a 14-character password expands to 16,384 candidates. |
+| `--unique` | Write each distinct line once. Accounts that share a password otherwise repeat it. Holds the distinct lines in memory. |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
 | `--min-length N` | Drop candidates shorter than N characters before writing them. |
 | `--max-length N` | Drop candidates longer than N characters before writing them. |
@@ -426,8 +471,9 @@ here fails CI.
 |---|---|
 | `-o, --output OUTPUT` | Output file. Defaults to stdout. |
 | `--full` | Keep the original line structure with the NT hash replaced. |
-| `--user-pass` | Emit 'username:plaintext'. Needs a dcsync-style input line. |
+| `--user-pass` | Emit 'username:plaintext'. Needs input lines that carry a username (dump lines or user:hash). |
 | `--only-cracked` | Omit uncracked entries instead of emitting <HASH_NOT_FOUND>. |
+| `--unique` | Write each distinct line once. Accounts that share a password otherwise repeat it. Holds the distinct lines in memory. |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
 | `--min-length N` | Drop candidates shorter than N characters before writing them. |
 | `--max-length N` | Drop candidates longer than N characters before writing them. |
@@ -491,10 +537,10 @@ here fails CI.
 | `-o, --output OUTPUT` | Output .rule file. Defaults to stdout. |
 | `--prefix-only` | Emit only prefix rules. |
 | `--suffix-only` | Emit only suffix rules. |
-| `--no-comments` | Omit the '# Prefix Rules' / '# Suffix Rules' headers so the file can be fed straight to hashcat -r without editing. |
+| `--no-comments` | Omit the '# Prefix Rules' / '# Suffix Rules' header lines. hashcat ignores them either way; this is for tools that do not. |
 | `--keep-duplicates` | Do not drop repeated rules. |
-| `--max-functions N` | Skip strings longer than N characters, since hashcat rejects rules with more than N functions (default: 31). |
-| `--allow-unsafe` | Emit rules for strings containing whitespace or '#' anyway. hashcat will misparse them; off by default. |
+| `--max-functions N` | Skip strings that need more than N rule functions, since hashcat rejects longer rules (default: 31). That is one function per character, or per byte for characters written as hex. |
+| `--hex-escape, --allow-unsafe` | Emit strings containing tabs, control characters or non-ASCII characters, writing those as \xNN hex bytes. Needs a hashcat version that supports \xNN in rules; off by default, and such strings are skipped. Spaces and '#' never need this. (--allow-unsafe is the old name for this option.) |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
 
 ---
@@ -507,8 +553,9 @@ pytest -q
 ruff check .
 ```
 
-CI byte-compiles every script, lints, runs the tests on Python 3.10–3.13, and
-compiles the C program checking it against the Python one.
+CI byte-compiles every script, lints, runs the tests on Python 3.10–3.13 on
+both Linux and Windows, and compiles the C program checking it against the
+Python one.
 
 ## Licence
 

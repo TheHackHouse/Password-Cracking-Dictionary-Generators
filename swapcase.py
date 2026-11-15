@@ -56,8 +56,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--keep-duplicates", action="store_true",
-        help="Do not drop candidates that are unchanged duplicates of each "
-             "other (e.g. two inputs that upper-case to the same string).",
+        help="Do not drop candidates that are duplicates of each other (e.g. "
+             "two inputs that upper-case to the same string). Dropping them "
+             "means remembering every distinct output, so use this for lists "
+             "larger than memory and run sort -u afterwards.",
     )
     cli.add_common_args(parser, force=False)
     cli.add_output_args(parser)
@@ -69,27 +71,35 @@ def main() -> None:
     cli.set_quiet(args.quiet)
     transform = MODES[args.mode]
 
-    stats = {"read": 0}
+    duplicates = 0
 
-    def transformed(handle):
+    def distinct(candidates):
+        nonlocal duplicates
         seen: set[str] = set()
-        for line in cli.iter_lines(handle):
-            stats["read"] += 1
-            candidate = transform(line)
-            if not args.keep_duplicates:
-                if candidate in seen:
-                    continue
-                seen.add(candidate)
-            yield candidate
+        add = seen.add
+        for candidate in candidates:
+            if candidate in seen:
+                duplicates += 1
+            else:
+                add(candidate)
+                yield candidate
 
     with cli.open_input(args.input) as infile, \
             cli.open_output(args.output, compress=args.gzip) as outfile:
+        # map() keeps the transform itself out of the Python loop. With
+        # --keep-duplicates nothing is remembered, so the whole run is
+        # streaming and the input can be any size.
+        candidates = map(transform, cli.iter_lines(infile))
+        if not args.keep_duplicates:
+            candidates = distinct(candidates)
         writer = cli.writer_for(outfile, args)
-        writer.feed(transformed(infile))
+        writer.feed(candidates)
         writer.close()
 
-    cli.log(f"Read {stats['read']:,} words with mode '{args.mode}': {writer.report()}.")
+    read = writer.written + writer.filtered + writer.skipped + duplicates
+    cli.log(f"Read {read:,} words with mode '{args.mode}': {writer.report()}"
+            + (f", {duplicates:,} duplicates dropped" if duplicates else "") + ".")
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

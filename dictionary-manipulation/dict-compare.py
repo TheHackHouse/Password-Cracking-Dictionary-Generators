@@ -13,6 +13,7 @@ gives noticeably better results.
 from __future__ import annotations
 
 import argparse
+import itertools
 import sys
 from pathlib import Path
 
@@ -62,16 +63,24 @@ def main() -> None:
     vocabulary = vocab.load(args.custom_dict)
 
     checked = matched = 0
+    invert = args.invert
     with cli.open_input(args.input) as infile, cli.open_output(args.output) as outfile:
-        for line in cli.iter_lines(infile):
-            tokens = line.split() if args.split_words else [line]
-            for token in tokens:
-                checked += 1
-                is_word = token.lower() in vocabulary
-                if is_word:
-                    matched += 1
-                if is_word == args.invert:
-                    outfile.write(token + "\n")
+        if args.split_words:
+            tokens = itertools.chain.from_iterable(map(str.split, infile))
+        else:
+            tokens = cli.iter_lines(infile)
+        # Tested and written a block at a time: one comprehension and one
+        # write per few thousand entries instead of a loop turn per entry.
+        while True:
+            batch = list(itertools.islice(tokens, cli.DEFAULT_CHUNK_SIZE))
+            if not batch:
+                break
+            wanted_tokens = [t for t in batch if (t.lower() in vocabulary) == invert]
+            checked += len(batch)
+            matched += len(wanted_tokens) if invert else len(batch) - len(wanted_tokens)
+            if wanted_tokens:
+                outfile.write("\n".join(wanted_tokens))
+                outfile.write("\n")
 
     wanted = "dictionary words" if args.invert else "non-dictionary words"
     cli.log(
@@ -81,4 +90,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

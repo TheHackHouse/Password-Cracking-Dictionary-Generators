@@ -8,8 +8,8 @@ Two modes:
   -d a.txt -d b.txt    one word from each dictionary, in the order given
 
 Any number of dictionaries can be supplied by repeating -d. The first one is
-streamed from disk rather than loaded, so the memory cost is set by the
-smaller lists rather than the largest.
+streamed from disk and never held in memory, so put the big list first: the
+memory cost is then set by the smaller lists, and the first can be any size.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import sys
+from math import perm
 from pathlib import Path
 
 _here = Path(__file__).resolve().parent
@@ -27,47 +28,74 @@ for _candidate in (_here, _here.parent):
 
 from wordlistlib import cli, estimate  # noqa: E402
 
+#: Most ready-made endings kept in memory. The trailing dictionaries are
+#: multiplied out once into a block of endings, as many dictionaries as fit
+#: under this, and the block is glued onto each leading word.
+TAIL_LIMIT = 1 << 20
 
-def survey_file(path: str) -> tuple[int, float]:
-    """Return the distinct word count and mean word length of a dictionary.
 
-    Counting up front is what lets the tool report the real candidate total
-    before writing anything; only the words of one file are held at a time.
+def survey_stream(path: str) -> tuple[int, float]:
+    """Count the words in the streamed (first) dictionary and their mean length.
+
+    One sequential pass that keeps nothing, so it works on a file of any
+    size. Duplicates are *not* removed -- that would mean holding every word
+    -- so a first dictionary with repeated lines produces repeated
+    candidates. Run it through ``sort -u`` first if that matters.
     """
-    seen: set[str] = set()
+    count = total = 0
     with cli.open_input(path) as handle:
-        for word in cli.iter_lines(handle):
-            seen.add(word)
-    if not seen:
-        return 0, 0.0
-    return len(seen), sum(len(w) for w in seen) / len(seen)
+        words = cli.iter_lines(handle)
+        while True:
+            block = list(itertools.islice(words, cli.DEFAULT_CHUNK_SIZE))
+            if not block:
+                break
+            count += len(block)
+            total += sum(map(len, block))
+    return count, (total / count if count else 0.0)
 
 
-def stream_file_words(path: str):
-    """Yield each distinct word from a file without holding the file in memory."""
-    seen: set[str] = set()
-    with cli.open_input(path) as handle:
-        for word in cli.iter_lines(handle):
-            if word in seen:
-                continue
-            seen.add(word)
-            yield word
+def dictionary_candidates(paths: list[str], rest: list[list[str]],
+                          lead: str, delimiter: str, trail: str):
+    """Yield ``lead + word1 + delimiter + word2 ... + trail`` for every combination.
+
+    ``rest`` holds the dictionaries after the first, already loaded. The
+    first is read line by line. The last few dictionaries are expanded into
+    one list of endings so the innermost loop is a single concatenation.
+    """
+    # Take dictionaries off the end while their product stays small enough.
+    # The last one always qualifies: it is in memory already.
+    split = len(rest)
+    size = 1
+    while split > 0 and (split == len(rest)
+                         or size * len(rest[split - 1]) <= TAIL_LIMIT):
+        size *= len(rest[split - 1])
+        split -= 1
+    middle, tail_lists = rest[:split], rest[split:]
+
+    if tail_lists:
+        tails = [
+            delimiter + delimiter.join(combo) + trail
+            for combo in itertools.product(*tail_lists)
+        ]
+    else:
+        tails = [trail]
+
+    with cli.open_input(paths[0]) as handle:
+        for first in cli.iter_lines(handle):
+            if middle:
+                for combo in itertools.product(*middle):
+                    head = lead + first + delimiter + delimiter.join(combo)
+                    yield from map(head.__add__, tails)
+            else:
+                yield from map((lead + first).__add__, tails)
 
 
-def dictionary_combinations(paths: list[str]):
-    """Cartesian product across dictionaries, streaming the first one."""
-    rest = [cli.load_wordlist(p) for p in paths[1:]]
-    for first in stream_file_words(paths[0]):
-        if rest:
-            for tail in itertools.product(*rest):
-                yield (first,) + tail
-        else:
-            yield (first,)
-
-
-def word_combinations(words: list[str], min_words: int, max_words: int):
+def word_candidates(words: list[str], min_words: int, max_words: int,
+                    lead: str, delimiter: str, trail: str):
+    join = delimiter.join
     for size in range(min_words, max_words + 1):
-        yield from itertools.permutations(words, size)
+        for combo in itertools.permutations(words, size):
+            yield lead + join(combo) + trail
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -75,7 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Generate a wordlist by combining words or dictionaries.",
         epilog=(
             "Examples:\n"
-            "  multiple-words-joiner.py -i 'mega,corp,2026' --min-words 2 -d- > list.txt\n"
+            "  multiple-words-joiner.py -i 'mega,corp,2026' --min-words 2 -D- > list.txt\n"
             "  multiple-words-joiner.py -d names.txt -d years.txt -D '-' -a '!' -o list.txt\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -86,7 +114,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "-d", "--dict", action="append", dest="dicts", metavar="FILE",
-        help="Dictionary file, one word per line. Repeat for each dictionary.",
+        help="Dictionary file, one word per line. Repeat for each dictionary. "
+             "The first is streamed and may be any size (its duplicate lines "
+             "are not removed); the others are loaded into memory.",
     )
     parser.add_argument("-o", "--output", help="Output file. Defaults to stdout.")
     parser.add_argument(
@@ -111,7 +141,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--min-words", type=int, default=None, metavar="N",
-        help="With -i, the fewest words per candidate (default: all of them).",
+        help="With -i, the fewest words per candidate (default: all of them, "
+             "or 1 when --max-words is given).",
     )
     parser.add_argument(
         "--max-words", type=int, default=None, metavar="N",
@@ -134,72 +165,69 @@ def main() -> None:
     if args.dicts and args.input:
         cli.die("use either -i or -d, not both")
 
+    # The affixes join like any other word, so `-p corp -D -` gives
+    # corp-mega-2025 rather than corpmega-2025 -- unless told otherwise.
+    delimiter = args.delimiter
+    affix_delimiter = "" if args.no_affix_delimiter else delimiter
+    lead = args.prepend + affix_delimiter if args.prepend else ""
+    trail = affix_delimiter + args.append if args.append else ""
+
     if args.dicts:
-        surveys = [survey_file(p) for p in args.dicts]
-        total = 1
-        avg_length = 0.0
-        for path, (size, mean_len) in zip(args.dicts, surveys, strict=True):
-            if size == 0:
-                cli.die(f"{path} contains no usable words")
-            cli.log(f"{path}: {size:,} distinct words")
-            total *= size
-            avg_length += mean_len
-        avg_length += len(args.delimiter) * (len(args.dicts) - 1)
-        combinations = dictionary_combinations(args.dicts)
+        if "-" in args.dicts:
+            cli.die("-d needs real files, not '-': each dictionary is read "
+                    "more than once, which stdin cannot do")
+        size, avg_length = survey_stream(args.dicts[0])
+        if size == 0:
+            cli.die(f"{args.dicts[0]} contains no usable words")
+        cli.log(f"{args.dicts[0]}: {size:,} words (streamed)")
+        total = size
+        rest = []
+        for path in args.dicts[1:]:
+            words = cli.load_wordlist(path)
+            cli.log(f"{path}: {len(words):,} distinct words")
+            total *= len(words)
+            avg_length += sum(map(len, words)) / len(words)
+            rest.append(words)
+        avg_length += len(delimiter) * (len(args.dicts) - 1)
+        candidates = dictionary_candidates(args.dicts, rest, lead, delimiter, trail)
     elif args.input:
-        words = list(dict.fromkeys(w for w in args.input.split(",") if w))
+        words = list(dict.fromkeys(w.strip() for w in args.input.split(",") if w.strip()))
         if not words:
             cli.die("-i did not contain any words")
-        max_words = args.max_words or len(words)
-        min_words = args.min_words or (1 if args.max_words else len(words))
+        max_words = len(words) if args.max_words is None else args.max_words
+        if args.min_words is not None:
+            min_words = args.min_words
+        else:
+            min_words = 1 if args.max_words is not None else len(words)
         if not 1 <= min_words <= max_words <= len(words):
             cli.die(
                 f"need 1 <= --min-words <= --max-words <= {len(words)} "
                 f"(got min={min_words}, max={max_words})"
             )
-        total = sum(
-            len(list(itertools.permutations(words, size)))
-            for size in range(min_words, max_words + 1)
-        )
+        # Counted arithmetically: n!/(n-k)! orderings of k words out of n.
+        # Building them to count them would exhaust memory at a dozen words.
+        sizes = range(min_words, max_words + 1)
+        counts = [perm(len(words), size) for size in sizes]
+        total = sum(counts)
         mean_word = sum(len(w) for w in words) / len(words)
-        mean_count = (min_words + max_words) / 2
-        avg_length = mean_word * mean_count + len(args.delimiter) * (mean_count - 1)
-        combinations = word_combinations(words, min_words, max_words)
+        mean_count = sum(n * size for n, size in zip(counts, sizes, strict=True)) / total
+        avg_length = mean_word * mean_count + len(delimiter) * (mean_count - 1)
+        candidates = word_candidates(words, min_words, max_words, lead, delimiter, trail)
     else:
         cli.die("provide either -i/--input or at least one -d/--dict")
 
-    affix = len(args.prepend) + len(args.append)
-    if not args.no_affix_delimiter:
-        affix += len(args.delimiter) * bool(args.prepend)
-        affix += len(args.delimiter) * bool(args.append)
     total = cli.sliced_total(total, args)
     estimate.confirm_or_exit(
         total,
-        avg_length=avg_length + affix,
+        avg_length=avg_length + len(lead) + len(trail),
         force=args.force,
         max_candidates=args.max_candidates,
         label="combinations",
     )
 
-    def rendered():
-        delimiter, prepend, append = args.delimiter, args.prepend, args.append
-        plain = args.no_affix_delimiter
-        for combo in combinations:
-            parts = list(combo)
-            if plain:
-                yield prepend + delimiter.join(parts) + append
-            else:
-                # The affixes join like any other word, so `-p corp -D -`
-                # gives corp-mega-2025 rather than corpmega-2025.
-                if prepend:
-                    parts.insert(0, prepend)
-                if append:
-                    parts.append(append)
-                yield delimiter.join(parts)
-
     with cli.open_output(args.output, compress=args.gzip) as out:
         writer = cli.writer_for(out, args)
-        writer.feed(rendered())
+        writer.feed(candidates)
         writer.close()
 
     cli.log(f"Combinations: {writer.report()}"
@@ -207,4 +235,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

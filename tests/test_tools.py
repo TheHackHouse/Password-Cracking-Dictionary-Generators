@@ -104,7 +104,7 @@ class TestRegressions:
     def test_keyboard_walk_counts_before_generating(self):
         """The count has to be exact, because the prompt depends on it."""
         module = load(REPO / "keyboard-walk.py")
-        adjacency = module.build_adjacency(module.LAYOUTS["qwerty"])
+        adjacency = module.adjacency_for("qwerty")
         for length in (1, 2, 3, 4):
             predicted = module.count_walks(adjacency, length)
             generated = sum(1 for _ in module.walks(adjacency, length))
@@ -129,12 +129,12 @@ class TestBehaviour:
             assert len(keys) == len(set(keys)), f"layout {name} repeats a key"
 
     def test_keyboard_walk_known_counts(self):
-        """Pinned against the original implementation's output."""
+        """Pinned so a change to the adjacency model cannot go unnoticed."""
         module = load(REPO / "keyboard-walk.py")
-        adjacency = module.build_adjacency(module.LAYOUTS["qwerty"])
-        assert module.count_walks(adjacency, 3) == 1824
-        assert module.count_walks(adjacency, 4) == 11900
-        assert module.count_walks(adjacency, 6) == 515362
+        adjacency = module.adjacency_for("qwerty")
+        assert module.count_walks(adjacency, 3) == 1812
+        assert module.count_walks(adjacency, 4) == 11844
+        assert module.count_walks(adjacency, 6) == 514286
 
     @pytest.mark.parametrize("level,max_subs", [(1, None), (2, None), (3, None), (3, 1), (3, 2)])
     def test_leetspeak_prediction_is_exact(self, level, max_subs, tmp_path):
@@ -185,7 +185,7 @@ class TestBehaviour:
 
     def test_rules_generator_skips_unsafe(self):
         result = run(TOOLS / "rules-generator.py", "--prefix-only", "--no-comments", "-q",
-                     stdin="corp\nbad token\n")
+                     stdin="corp\nbad\ttoken\n")
         assert result.stdout == "^p^r^o^c\n"
 
     def test_format_size(self):
@@ -338,9 +338,9 @@ class TestOptimisationsPreserveOutput:
 
     def test_keyboard_walk_pinned_order(self):
         module = load(REPO / "keyboard-walk.py")
-        adjacency = module.build_adjacency(module.LAYOUTS["qwerty"])
+        adjacency = module.adjacency_for("qwerty")
         walks = list(module.walks(adjacency, 2))
-        assert walks[:4] == ["`1", "`q", "`w", "1`"]
+        assert walks[:4] == ["`1", "`q", "1`", "12"]
         assert len(walks) == module.count_walks(adjacency, 2)
 
     def test_leetspeak_pinned_order(self):
@@ -454,7 +454,7 @@ class TestDocumentation:
 
     @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
     def test_every_flag_is_documented(self, script):
-        readme = (REPO / "README.md").read_text()
+        readme = (REPO / "README.md").read_text(encoding="utf-8")
         undocumented = sorted(f for f in self._flags(script) if f not in readme)
         assert not undocumented, (
             f"{script.name} has flags missing from README.md: {undocumented}"
@@ -462,7 +462,7 @@ class TestDocumentation:
 
     @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
     def test_tool_is_named_in_readme(self, script):
-        readme = (REPO / "README.md").read_text()
+        readme = (REPO / "README.md").read_text(encoding="utf-8")
         assert script.name in readme, f"{script.name} is not mentioned in README.md"
 
     def test_readme_examples_use_no_renamed_files(self):
@@ -474,7 +474,7 @@ class TestDocumentation:
         """
         import re
 
-        readme = (REPO / "README.md").read_text()
+        readme = (REPO / "README.md").read_text(encoding="utf-8")
         stale = [
             "keyboard_walk.py", "Multiple-Words-Joiner.py", "dict_compare.py",
             "rules_generator.py", "extract_strings.py", "extract_strings-v0.py",

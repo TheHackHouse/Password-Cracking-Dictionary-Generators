@@ -57,19 +57,17 @@ def main() -> None:
         cli.die("--min-length cannot be negative")
     if args.max_length is not None and args.max_length < args.min_length:
         cli.die("--max-length cannot be smaller than --min-length")
-    if args.sort and not args.output:
-        cli.die("--sort needs -o/--output (it rewrites the file in place)")
+    if args.sort and args.output in (None, "-"):
+        cli.die("--sort needs -o/--output with a file (it rewrites the file in place)")
 
-    read = kept = 0
     with cli.open_input(args.input) as infile, cli.open_output(args.output) as outfile:
-        for line in cli.iter_lines(infile):
-            read += 1
-            if len(line) < args.min_length:
-                continue
-            if args.max_length is not None and len(line) > args.max_length:
-                continue
-            outfile.write(line + "\n")
-            kept += 1
+        # The writer does the length test a block of lines at a time, so
+        # there is no per-line Python loop anywhere on this path.
+        writer = cli.CandidateWriter(
+            outfile, min_length=args.min_length, max_length=args.max_length
+        )
+        kept = writer.feed(cli.iter_lines(infile))
+    read = kept + writer.filtered
 
     if args.sort:
         cli.sort_unique_file(args.output)
@@ -81,4 +79,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

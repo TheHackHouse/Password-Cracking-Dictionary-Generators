@@ -5,10 +5,11 @@ Feed it cracked passwords and it decomposes 'summerbreeze2026' into the words
 'summer' and 'breeze' with '2026' left over. The words make a targeted base
 dictionary and the leftovers make good rule material for the next round.
 
-The matcher takes the longest word first but backtracks to shorter candidates
-when the remainder cannot be split. The previous version gave up on the first
-dead end -- and memoised the failure -- so a string like 'passwordsy' was
-discarded whole rather than split into 'password' + 'sy'.
+The matcher finds the split that covers as much of the string as possible
+with dictionary words, using as few (so as long) words as it can. Characters
+no word accounts for -- digits, symbols, unknown fragments -- are stepped over
+and reported as leftovers; they do not stop the words around them from being
+found.
 """
 
 from __future__ import annotations
@@ -26,36 +27,76 @@ for _candidate in (_here, _here.parent):
 from wordlistlib import cli, vocab  # noqa: E402
 
 
+def word_starts(vocabulary: set[str], min_length: int) -> frozenset[str]:
+    """The first ``min_length`` characters of every usable vocabulary word.
+
+    A position whose next ``min_length`` characters are not in this set
+    cannot begin a word, which lets the matcher skip almost every position
+    in a typical password without trying a single substring there.
+    """
+    min_length = max(1, min_length)
+    return frozenset(word[:min_length] for word in vocabulary if len(word) >= min_length)
+
+
 def split_into_words(
-    text: str, vocabulary: set[str], min_length: int
-) -> list[tuple[int, int]] | None:
-    """Return ``[(start, end), ...]`` covering ``text`` with dictionary words.
+    text: str, vocabulary: set[str], min_length: int, max_length: int | None = None,
+    starts: frozenset[str] | None = None,
+) -> list[tuple[int, int]]:
+    """Return the ``(start, end)`` spans of the dictionary words in ``text``.
+
+    The spans do not overlap and are in order. They are the choice that
+    covers the most characters; among equals, the one with the fewest words,
+    then the one whose earlier words are longer. An empty list means no
+    dictionary word was found.
+
+    ``max_length`` (the longest word in the vocabulary) and ``starts`` (from
+    :func:`word_starts`) are optional and only make it faster: the first
+    bounds the work per character, the second skips positions where no word
+    can begin. The result is the same with or without them.
 
     Offsets are returned rather than the words themselves so the caller can
     remove exactly the matched spans; removing by text would strip the wrong
     occurrence when a word repeats.
     """
-    memo: dict[int, list[tuple[int, int]] | None] = {}
+    size = len(text)
+    # Lowercasing can change a string's length for a few characters, which
+    # would make the offsets point at the wrong place; match as-is then.
     lowered = text.lower()
+    if len(lowered) != size:
+        lowered = text
+    longest = size if max_length is None else min(max_length, size)
+    min_length = max(1, min_length)
 
-    def search(start: int) -> list[tuple[int, int]] | None:
-        if start == len(text):
-            return []
-        if start in memo:
-            return memo[start]
-
-        memo[start] = None  # guards against re-entry on pathological input
-        # Longest candidate first, but keep trying shorter ones on failure.
-        for end in range(len(text), start + min_length - 1, -1):
+    # Worked backwards and iteratively (a line can be thousands of characters
+    # long, far past the recursion limit). covered[i] / words[i] describe the
+    # best split of text[i:]; step[i] is where its first word ends, or 0 when
+    # the character at i is not part of any word.
+    covered = [0] * (size + 1)
+    words = [0] * (size + 1)
+    step = [0] * (size + 1)
+    for start in range(size - 1, -1, -1):
+        best_covered, best_words, best_end = covered[start + 1], words[start + 1], 0
+        if starts is not None and lowered[start:start + min_length] not in starts:
+            covered[start], words[start] = best_covered, best_words
+            continue
+        for end in range(min(size, start + longest), start + min_length - 1, -1):
             if lowered[start:end] in vocabulary:
-                remainder = search(end)
-                if remainder is not None:
-                    memo[start] = [(start, end)] + remainder
-                    return memo[start]
-        memo[start] = None
-        return None
+                total = end - start + covered[end]
+                count = 1 + words[end]
+                if total > best_covered or (total == best_covered and count < best_words):
+                    best_covered, best_words, best_end = total, count, end
+        covered[start], words[start], step[start] = best_covered, best_words, best_end
 
-    return search(0)
+    spans = []
+    position = 0
+    while position < size:
+        end = step[position]
+        if end:
+            spans.append((position, end))
+            position = end
+        else:
+            position += 1
+    return spans
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -104,11 +145,13 @@ def main() -> None:
         cli.die("--known-out and --remaining-out must be different files")
 
     vocabulary = vocab.load(args.custom_dict)
+    longest_word = max(map(len, vocabulary))
+    starts = word_starts(vocabulary, args.min_word_length)
 
     lines = split_count = word_count = remainder_count = 0
     try:
-        known_file = open(args.known_out, "w", encoding="utf-8", newline="\n")
-        remaining_file = open(args.remaining_out, "w", encoding="utf-8", newline="\n")
+        known_file = cli.create_text_file(args.known_out)
+        remaining_file = cli.create_text_file(args.remaining_out)
     except OSError as exc:
         cli.die(f"cannot open output file: {exc}")
 
@@ -116,23 +159,26 @@ def main() -> None:
         with cli.open_input(args.input) as infile:
             for line in cli.iter_lines(infile):
                 lines += 1
-                spans = split_into_words(line, vocabulary, args.min_word_length)
+                spans = split_into_words(
+                    line, vocabulary, args.min_word_length, longest_word, starts
+                )
                 if not spans:
                     remaining_file.write(line + "\n")
                     remainder_count += 1
                     continue
 
                 split_count += 1
-                covered = bytearray(len(line))
-                for start, end in spans:
-                    known_file.write(line[start:end] + "\n")
-                    word_count += 1
-                    for i in range(start, end):
-                        covered[i] = 1
-                leftover = "".join(c for i, c in enumerate(line) if not covered[i])
-                if leftover:
-                    remaining_file.write(leftover + "\n")
-                    remainder_count += 1
+                # Each stretch between words is its own leftover, so
+                # 'acme2026summer!' leaves '2026' and '!', not '2026!'.
+                position = 0
+                for start, end in [*spans, (len(line), len(line))]:
+                    if start > position:
+                        remaining_file.write(line[position:start] + "\n")
+                        remainder_count += 1
+                    if end > start:
+                        known_file.write(line[start:end] + "\n")
+                        word_count += 1
+                    position = end
     finally:
         known_file.close()
         remaining_file.close()
@@ -148,4 +194,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    cli.run(main)

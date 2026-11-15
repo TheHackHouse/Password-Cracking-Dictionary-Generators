@@ -87,8 +87,15 @@ int main(int argc, char *argv[]) {
             output_file = argv[i];
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--max-upper")) {
             if (++i >= argc) { fprintf(stderr, "error: %s needs a value\n", arg); return EXIT_FAILURE; }
-            max_upper = atoi(argv[i]);
-            if (max_upper < 0) { fprintf(stderr, "error: --max-upper cannot be negative\n"); return EXIT_FAILURE; }
+            /* strtol, not atoi: "-m abc" must be an error, not a silent 0. */
+            char *end = NULL;
+            long value = strtol(argv[i], &end, 10);
+            if (end == argv[i] || *end != '\0') {
+                fprintf(stderr, "error: --max-upper needs a whole number, got '%s'\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            if (value < 0) { fprintf(stderr, "error: --max-upper cannot be negative\n"); return EXIT_FAILURE; }
+            max_upper = value > MAX_LENGTH ? MAX_LENGTH : (int)value;
         } else if (arg[0] == '-' && arg[1] != '\0') {
             fprintf(stderr, "error: unknown option %s\n", arg);
             usage(argv[0]);
@@ -184,10 +191,12 @@ int main(int argc, char *argv[]) {
     size_t block_used = 0;
     const size_t record = (size_t)length + 1;
     const size_t block_limit = sizeof(block) - record;
+    int write_failed = 0;         /* a full disk must not pass for success */
 #define EMIT()                                                   \
     do {                                                         \
         if (block_used > block_limit) {                          \
-            fwrite(block, 1, block_used, out);                   \
+            if (fwrite(block, 1, block_used, out) != block_used) \
+                write_failed = 1;                                \
             block_used = 0;                                      \
         }                                                        \
         memcpy(block + block_used, candidate, record);           \
@@ -210,7 +219,7 @@ int main(int argc, char *argv[]) {
            the order matches itertools.product in the Python twin -- the two
            produce byte-identical files. */
         unsigned long long masks = 1ULL << cased;
-        for (unsigned long long mask = 0; mask < masks; mask++) {
+        for (unsigned long long mask = 0; mask < masks && !write_failed; mask++) {
             for (int i = 0; i < cased; i++) {
                 int p = positions[cased - 1 - i];
                 candidate[p] = (mask >> i) & 1ULL
@@ -224,7 +233,7 @@ int main(int argc, char *argv[]) {
            masks by popcount, which is what makes `-m 2` on a long word cheap.
            Order matches itertools.combinations in the Python twin. */
         int idx[MAX_LENGTH];
-        for (int k = 0; k <= max_upper; k++) {
+        for (int k = 0; k <= max_upper && !write_failed; k++) {
             if (k > cased) break;
             for (int i = 0; i < k; i++) idx[i] = i;
             while (1) {
@@ -235,7 +244,7 @@ int main(int argc, char *argv[]) {
                 }
                 EMIT();
 
-                if (k == 0) break;
+                if (k == 0 || write_failed) break;
                 int i = k - 1;
                 while (i >= 0 && idx[i] == cased - k + i) i--;
                 if (i < 0) break;
@@ -245,12 +254,20 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (block_used) fwrite(block, 1, block_used, out);
+    if (block_used && fwrite(block, 1, block_used, out) != block_used) write_failed = 1;
 #undef EMIT
 
-    if (out != stdout) {
-        fclose(out);
-        if (!quiet) fprintf(stderr, "Wrote %llu permutations to %s\n", total, output_file);
+    /* The data may still be sitting in stdio's buffer, so the flush and the
+       close are where a full disk or a closed pipe actually shows up. */
+    if (fflush(out) != 0) write_failed = 1;
+    if (out != stdout && fclose(out) != 0) write_failed = 1;
+    if (write_failed) {
+        fprintf(stderr, "error: writing to %s failed (disk full or pipe closed?)\n",
+                output_file ? output_file : "stdout");
+        return EXIT_FAILURE;
     }
+
+    if (out != stdout && !quiet)
+        fprintf(stderr, "Wrote %llu permutations to %s\n", total, output_file);
     return EXIT_SUCCESS;
 }

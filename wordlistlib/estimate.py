@@ -52,9 +52,10 @@ def confirm_or_exit(
     leetspeak generator can, because it knows every substitution length);
     otherwise pass ``avg_length`` for an estimate.
 
-    ``--force`` skips the prompt entirely. Without a terminal attached and
-    without ``--force``, anything over ``max_candidates`` is refused rather
-    than silently filling the disk.
+    Jobs up to ``max_candidates`` just run. Past that the user is asked on
+    the terminal, ``--force`` skips the question, and with no terminal
+    attached and no ``--force`` the job is refused rather than silently
+    filling the disk.
     """
     if exact_bytes is None:
         exact_bytes = estimate_size(count, avg_length or 0)
@@ -65,11 +66,7 @@ def confirm_or_exit(
     cli.log(f"Total {label}: {format_count(count)}")
     cli.log(f"Output size: {qualifier}{format_size(exact_bytes)}")
 
-    if force:
-        return
-
-    if count <= max_candidates and not sys.stdin.isatty():
-        # Small job in a script: just run it.
+    if force or count <= max_candidates:
         return
 
     if not sys.stdin.isatty():
@@ -79,10 +76,9 @@ def confirm_or_exit(
             f"Re-run with --force to proceed anyway."
         )
 
-    try:
-        answer = input("Do you want to continue? (y/N): ").strip().lower()
-    except EOFError:
-        answer = ""
+    answer = cli.prompt("Do you want to continue? (y/N): ").lower()
     if answer not in ("y", "yes"):
-        cli.log("Aborted.")
-        raise SystemExit(0)
+        # Non-zero: nothing was generated, and a script that reached this
+        # prompt (Windows reports NUL as a terminal) must be able to tell.
+        print("Aborted.", file=sys.stderr)
+        raise SystemExit(1)
