@@ -1,71 +1,69 @@
 # Password Cracking Dictionary Generators
 
-A collection of small tools for building targeted password-cracking
-dictionaries. They are most useful when you have some idea what the password
-is likely to look like — a company name, a site code, a season and a year —
-and want to turn that guess into a candidate list.
+Scripts for building targeted wordlists. Use them when you already have a
+rough idea of the password (a company name, a site code, a season plus a
+year) and need a candidate list built around it.
 
-The generated lists are rarely worth much on their own. The intended use is as
-a *base* dictionary that you then attack with hashcat rules.
+The output is meant as a base dictionary to run hashcat rules against. On its
+own it won't crack much.
 
-## Conventions
+## Common options
 
-Every tool follows the same conventions, so they pipe together:
+All the tools share these, so they can be piped together.
 
 | | |
 |---|---|
-| `-i`, `--input` | input file; **defaults to stdin** |
-| `-o`, `--output` | output file; **defaults to stdout** |
-| `-q`, `--quiet` | suppress progress and statistics |
-| `--force` | skip the size confirmation prompt (for scripted runs) |
+| `-i`, `--input` | input file, stdin if not given |
+| `-o`, `--output` | output file, stdout if not given |
+| `-q`, `--quiet` | no progress or statistics |
+| `--force` | skip the size confirmation prompt |
 
-Candidates go to **stdout**; counts, warnings and prompts go to **stderr**.
-`tool ... > list.txt` therefore always produces a clean wordlist.
+Candidates are written to stdout. Counts, warnings and prompts are written to
+stderr, so `tool ... > list.txt` gives a clean wordlist.
 
-Every generator works out how many candidates it is about to produce *before*
-producing any, prints the count and the output size, and asks for confirmation
-past 50 million (`--max-candidates` to change, `--force` to skip).
+Generators print the candidate count and output size before they start. Above
+50 million candidates they ask for confirmation. Change the threshold with
+`--max-candidates` or skip the prompt with `--force`.
 
-Output is UTF-8 with `\n` line endings on every platform, and `-o list.txt`
-and `> list.txt` produce the same bytes. Input bytes that are not valid UTF-8
-— most large real-world wordlists contain some — pass through unchanged.
+Output is UTF-8 with `\n` line endings on all platforms. `-o list.txt` and
+`> list.txt` write the same bytes. Input bytes that aren't valid UTF-8 are
+passed through unchanged (rockyou and most other big lists contain some).
 
-Wordlists are streamed: a list given with `-i` is read line by line and not
-held in memory, so it can be far larger than RAM (memory stays in the tens of
-megabytes on a multi-gigabyte input). The exceptions are the ones that have
-to remember what they have seen, each noted below: dropping duplicates
-(`swapcase.py` by default, `--unique` in the hash joiners), the second and
-later dictionaries of `multiple-words-joiner.py`, and the reference word list
-of the dictionary tools. `case-permutation.py` reads a file twice, once to
-size the job and once to generate, so words piped on stdin are kept instead.
-Sorting uses the system `sort -u` when there is one and an in-process
-external merge sort when there is not (plain Windows), neither of which
-needs the file to fit in memory.
+### Large files
+
+Input given with `-i` is read a line at a time, so it can be bigger than RAM.
+Memory use on a 2 GB list was about 25 MB. These cases do hold data in memory:
+
+- `swapcase.py` when dropping duplicates (the default), and `--unique` in the
+  hash joiners
+- the second and later dictionaries in `multiple-words-joiner.py`
+- the reference word list in `dict-compare.py` and `dict-extractor.py`
+- words piped to `case-permutation.py` on stdin. It makes two passes, one to
+  count and one to generate. With `-i FILE` it reads the file twice instead.
+
+Sorting uses the system `sort -u` if there is one. On Windows without it, the
+tools use their own external merge sort. Neither needs the file to fit in
+memory.
 
 ## Install
 
-Nothing to install — they are standalone Python 3.10+ scripts that only need
-the `wordlistlib/` directory alongside them.
+There is no install step. These are Python 3.10+ scripts. Keep the
+`wordlistlib/` directory next to them.
 
 ```sh
-gcc -O3 -march=native -o case-permutation case-permutation.c   # optional fast path
-pip install -r requirements.txt   # optional: nltk, for dict-compare/dict-extractor
+gcc -O3 -march=native -o case-permutation case-permutation.c   # optional, faster case permutation
+pip install -r requirements.txt   # optional, nltk for dict-compare/dict-extractor
 ```
 
-`dict-compare.py` and `dict-extractor.py` need a reference word list. They use
-`--custom-dict` if you give them one, otherwise the NLTK corpus if `nltk` is
-installed, otherwise the system word list at `/usr/share/dict/words`. So
-`nltk` is optional.
-
----
+`dict-compare.py` and `dict-extractor.py` need a reference word list. They
+look for one in this order: `--custom-dict`, the NLTK corpus if `nltk` is
+installed, then `/usr/share/dict/words`.
 
 ## Generators
 
 ### leetspeak-generator.py
 
-Generates leetspeak variations of a phrase.
-
-Substitutions are grouped into levels so the output stays a usable size:
+Leetspeak variations of a phrase. Substitutions come in three levels:
 
 | level | adds |
 |---|---|
@@ -73,25 +71,30 @@ Substitutions are grouped into levels so the output stays a usable size:
 | 2 | symbol swaps: `a→@ b→8 c→( g→6 h→# i→! l→1 s→$ t→7 z→2` |
 | 3 | multi-character: `d→|) k→|< m→/\/\ u→|_| v→\/ x→><` and more |
 
-Case variants are always included, and `-`, `_`, ` ` are tried for spaces.
+Upper and lower case of each letter are included. Spaces are tried as `-`,
+`_` and ` `.
 
 ```sh
 leetspeak-generator.py -i "mega corp" --level 1 -o base.txt
 leetspeak-generator.py -i "mega corp" --level 3 --max-subs 2 > base.txt
 ```
 
-`--max-subs N` is the one to reach for: real leetspeak substitutes one to
-three characters, not all of them, and the cap is what keeps the list
-realistic as well as small. For `mega corp`: level 1 is 2,592 candidates,
-level 3 unrestricted is 20,736, level 3 with `--max-subs 2` is 10,560.
+`--max-subs N` caps how many characters are substituted in one candidate.
+People usually swap one to three characters, so a cap of 2 or 3 gives a
+smaller and more realistic list. For `mega corp`:
 
-The reported count and output size are exact, not estimates — multi-character
-substitutions are measured at their true length.
+| options | candidates |
+|---|---|
+| `--level 1` | 2,592 |
+| `--level 3` | 20,736 |
+| `--level 3 --max-subs 2` | 10,560 |
+
+The count and size printed before the run are exact.
 
 ### case-permutation.py / case-permutation.c
 
-Every distinct combination of upper and lower case for a word. Characters with
-no case are left alone, so there are no duplicate lines.
+Every upper and lower case combination of a word. Digits and symbols are left
+as they are, so the output has no duplicate lines.
 
 ```sh
 case-permutation.py -w megacorp -o perms.txt
@@ -100,11 +103,13 @@ case-permutation.py --common -i words.txt          # lower/UPPER/Title/swapped
 cat words.txt | case-permutation.py > cased.txt
 ```
 
-Growth is 2^n in the number of letters, so `--max-upper N` (real passwords are
-`Password` or `PassWord`, not `pAsSwOrD`) or `--common` are what make this
-practical on anything long.
+The number of candidates doubles with every letter. For long words, use
+`--max-upper N` to limit how many letters are capitalised, or `--common` to
+get only the lower, UPPER, Capitalised, sWAPPED and Title Case forms.
 
-The C build takes the same flags and produces byte-identical output:
+The C version takes the same flags, writes the same output and is faster. If
+the compiled binary is next to the script, `case-permutation.py -w` runs it
+automatically. Pass `--no-c` to stop that.
 
 ```sh
 gcc -O3 -march=native -o case-permutation case-permutation.c
@@ -113,7 +118,7 @@ gcc -O3 -march=native -o case-permutation case-permutation.c
 
 ### keyboard-walk.py
 
-Walks along adjacent keys — `1q2w3e`, `qwerty`, `zaqwsx`.
+Sequences of adjacent keys such as `1q2w3e`, `qwerty` and `zaqwsx`.
 
 ```sh
 keyboard-walk.py -l 4 -k qwerty -o walks4.txt
@@ -123,19 +128,24 @@ keyboard-walk.py -l 6 -k qwertyshifted2 --force > walks6.txt
 Layouts: `qwerty`, `qwertyshifted`, `qwertyshifted1`, `qwertyshifted2`,
 `dvorak`, `azerty`.
 
-Keys are neighbours when they touch on a grid in which the number row sits
-one key to the left of the letter rows — `1` above `q`, `2` above `w` — which
-is what makes `1q2w3e`, `1qaz` and `zaq1` all walks.
+Adjacency is worked out on a grid where the number row is shifted one key to
+the left, so `1` is above `q` and `2` is above `w`. Each key has up to eight
+neighbours.
 
-Walk counts grow about 6.6× per character on qwerty (length 4 is 11,844;
-length 6 is 514,286; length 8 is roughly 22 million), so check the reported
-count before committing to a long run. The count is computed arithmetically
-and takes under a millisecond at any length.
+Counts grow about 6.6 times per extra character on qwerty:
+
+| length | walks |
+|---|---|
+| 4 | 11,844 |
+| 6 | 514,286 |
+| 8 | 22,570,032 |
+
+Check the count the tool prints before starting a long run.
 
 ### multiple-words-joiner.py
 
-Combines words into candidates, either as orderings of a given set or as a
-product across dictionaries.
+Joins words into candidates. With `-i` it writes every ordering of the words
+you give it. With `-d` it takes one word from each dictionary.
 
 ```sh
 # every ordering of the three words
@@ -148,39 +158,38 @@ multiple-words-joiner.py -i 'mega,corp,2026' --min-words 1 -o list.txt
 multiple-words-joiner.py -d names.txt -d years.txt -D '-' -a '!' -o list.txt
 ```
 
-Repeat `-d` for as many dictionaries as you like. The first is streamed from
-disk and never held in memory, so put the big list first — it can be any
-size. The others are loaded. Because the first is not held, its duplicate
-lines are not removed; `sort -u` it beforehand if it has any.
+`-d` can be repeated. The first dictionary is read from disk as it goes and
+can be any size, so put the largest one first. The others are loaded into
+memory. Duplicate lines in the first dictionary are not removed. Run
+`sort -u` on it first if that matters.
 
-`--prepend` and `--append` are separated from the words by `--delimiter`, so
-`-p corp -D -` gives `corp-mega-2025`. Pass `--no-affix-delimiter` to butt
-them straight against the words instead.
+`--prepend` and `--append` are joined to the words with `--delimiter`, so
+`-p corp -D -` gives `corp-mega-2025`. Add `--no-affix-delimiter` to get
+`corpmega-2025`.
 
 ### swapcase.py
 
-One case transformation applied to every word in a list. The default inverts
-each character's case — the "left caps lock on and still used shift" pattern.
+Applies one case change to every word in a list. The default swaps the case
+of each character, which is what you get when someone types with caps lock
+on.
 
 ```sh
 swapcase.py -i dictionary.txt -o swapped.txt
 cat dictionary.txt | swapcase.py --mode title > titled.txt
 ```
 
-Modes: `swap` (default), `upper`, `lower`, `title`, `capitalize`. For *every*
-case combination rather than one transformation, use `case-permutation.py`.
+Modes: `swap` (default), `upper`, `lower`, `title`, `capitalize`. To get
+every case combination of a word, use `case-permutation.py`.
 
-Duplicate outputs are dropped by default, which means remembering every
-distinct one. For a list larger than memory pass `--keep-duplicates`, which
-makes the run fully streaming, and `sort -u` the result.
-
----
+Duplicates are dropped by default, which keeps every distinct output in
+memory. For lists larger than RAM, pass `--keep-duplicates` and run `sort -u`
+on the result.
 
 ## Hash joiners
 
 ### lm-hash-joiner.py
 
-Rejoins cracked LM hash halves into whole passwords.
+Puts cracked LM hash halves back together into full passwords.
 
 ```sh
 hashcat -m 3000 lm-halves.txt rockyou.txt --potfile-path lm.pot
@@ -189,26 +198,28 @@ lm-hash-joiner.py lm.pot lm-hashes.txt --only-cracked --permute-case -m 2 \
 hashcat -m 1000 nt-hashes.txt nt-candidates.txt
 ```
 
-LM is case-insensitive, so everything recovered is uppercase and will not
-match the corresponding NT hash as-is — `--permute-case` (or a separate run of
-`case-permutation.py`) is what closes that gap. `-m/--max-upper` caps the
-expansion; without it a 14-character password becomes 16,384 candidates.
+LM uppercases the password before hashing, so everything recovered is
+uppercase and won't match the NT hash directly. `--permute-case` writes the
+case variants. `-m/--max-upper` limits how many letters are capitalised in
+each candidate. Without it a 14-character password produces 16,384
+candidates.
 
-`AAD3B435B51404EE` (an empty second half, i.e. a password under 8 characters)
-resolves to an empty string rather than being reported as uncracked. When
-*both* halves are that value there is no LM hash at all — LM storage is off,
-or the password is longer than 14 characters — so the entry is skipped and
-counted as "no LM hash stored" rather than emitted as an empty password.
+The half `AAD3B435B51404EE` is an empty half, meaning the password is shorter
+than 8 characters. It resolves to an empty string. If both halves are
+`AAD3B435B51404EE`, no LM hash was stored (LM is disabled, or the password is
+longer than 14 characters). Those entries are skipped and counted as "no LM
+hash stored".
 
-Accepts hashcat (`<16 hex>:<plain>`) and John (`$LM$<16 hex>:<plain>`) pot
-files, and picks the LM field (always the third) out of dcsync-style lines.
-hashcat's `$HEX[...]` plaintexts are decoded, and a plaintext's leading or
-trailing spaces are kept. `--unique` writes a password shared by several
-accounts once.
+Pot files can be in hashcat format (`<16 hex>:<plain>`) or John format
+(`$LM$<16 hex>:<plain>`). The hash file can be bare 32-character hashes or
+`secretsdump.py` style lines, where the LM hash is the third field.
+`$HEX[...]` plaintexts are decoded. Leading and trailing spaces in a
+plaintext are kept. `--unique` writes a password once when several accounts
+share it.
 
 ### nt-hash-joiner.py
 
-Maps NT hashes back to plaintexts you have already cracked.
+Looks up NT hashes in a pot file and writes the plaintexts.
 
 ```sh
 nt-hash-joiner.py nt.pot domain.ntds --user-pass -o cracked.txt
@@ -217,30 +228,31 @@ nt-hash-joiner.py nt.pot domain.ntds --only-cracked > wordlist.txt
 
 | flag | output |
 |---|---|
-| *(none)* | just the plaintext — a wordlist |
-| `--user-pass` | `username:plaintext` — the reporting format |
+| *(none)* | plaintext only, for use as a wordlist |
+| `--user-pass` | `username:plaintext`, for reporting |
 | `--full` | the original line with the NT hash replaced |
-| `--only-cracked` | drop entries that are not in the pot file |
+| `--only-cracked` | leave out entries that are not in the pot file |
 | `--unique` | write each distinct line once |
 
-Input lines are recognised by shape, so real `secretsdump.py` / NTDS output
-(`user:rid:lmhash:nthash:::`) works, as do `user:hash` lines (what
-`hashcat --username` takes) and a file of bare 32-character hashes.
-`31D6CFE0...` is reported as `<BLANK_PASSWORD>` rather than as uncracked, and
-is kept out of plain wordlist output. hashcat's `$HEX[...]` plaintexts are
-decoded, so a report shows the password rather than its hex, and a
-plaintext's leading or trailing spaces are kept.
+Accepted hash file formats:
 
----
+- `secretsdump.py` / NTDS lines (`user:rid:lmhash:nthash:::`)
+- `user:hash` (the `hashcat --username` format)
+- one 32-character hash per line
+
+The empty-password hash `31D6CFE0...` is written as `<BLANK_PASSWORD>` in
+`--user-pass` and `--full` output and left out of plain wordlist output.
+`$HEX[...]` plaintexts are decoded. Leading and trailing spaces in a
+plaintext are kept.
 
 ## dictionary-manipulation/
 
-Tools for mining an existing set of cracked passwords for the next round.
+Tools for pulling useful material out of passwords you have already cracked.
 
 ### extract-strings.py
 
-Splits strings into runs of letters, digits and special characters — the
-building blocks of the password set you are looking at.
+Splits each string into runs of letters, digits and special characters, and
+writes each type to its own file.
 
 ```sh
 extract-strings.py -i cracked.txt --out-dir parts/
@@ -248,40 +260,44 @@ extract-strings.py -i cracked.txt --categories letters -o words.txt
 cat cracked.txt | extract-strings.py --categories numbers -o - --no-sort
 ```
 
-Categories: `letters`, `short_letters` (1–2 characters), `numbers`,
-`specials`. `--unicode` keeps accented letters as letters instead of treating
-them as symbols. Output is sorted and deduplicated unless `--no-sort`.
+Categories: `letters`, `short_letters`, `numbers`, `specials`.
+`short_letters` is runs of 1 or 2 letters. `--unicode` counts accented
+letters as letters. Without it they count as special characters. Output is
+sorted and deduplicated unless you pass `--no-sort`.
 
 ### dict-extractor.py
 
-Decomposes strings into their component dictionary words plus the leftovers —
-`summerbreeze2026` becomes `summer`, `breeze` and `2026`.
+Splits strings into dictionary words and whatever is left over.
+`summerbreeze2026` puts `summer` and `breeze` in the words file and `2026` in
+the leftovers file.
 
 ```sh
 dict-extractor.py -i cracked.txt --known-out words.txt --remaining-out rest.txt
 dict-extractor.py -i cracked.txt --custom-dict english.txt --min-word-length 5
 ```
 
-The matcher picks the split that covers the most characters with dictionary
-words, using as few words as it can. Whatever no word accounts for is stepped
-over rather than spoiling the match, and each such stretch is written to the
-leftovers on its own line.
+It picks the split that covers the most characters with dictionary words,
+using the fewest words. Each leftover piece goes on its own line.
 
 ### dict-compare.py
 
-Separates dictionary words from everything else. The leftovers — names, site
-codes, product names — are usually the targeted material worth keeping.
+Splits a list into dictionary words and non-dictionary words. By default it
+writes the non-dictionary ones (names, site codes, product names), which are
+usually the more useful for a targeted list. `--invert` writes the dictionary
+words.
 
 ```sh
 dict-compare.py -i cracked.txt -o not-words.txt
 dict-compare.py -i cracked.txt --invert --custom-dict english.txt
 ```
 
-Both the NLTK corpus and `/usr/share/dict/words` are archaic and have no
-names, brands or plurals, so `--custom-dict` with a real cracked-password
-corpus gives much better results.
+The NLTK corpus and `/usr/share/dict/words` are dated and have no names,
+brands or plurals. A word list built from real cracked passwords, passed with
+`--custom-dict`, works better.
 
 ### filter-by-length.py
+
+Keeps the lines whose length is within a range.
 
 ```sh
 filter-by-length.py -i words.txt --max-length 3 -o short.txt
@@ -290,8 +306,8 @@ filter-by-length.py -i words.txt --min-length 8 > long.txt
 
 ### rules-generator.py
 
-Turns a list of strings into hashcat prefix and suffix rules, so a base
-dictionary can be decorated with company names, years and site codes.
+Converts a list of strings into hashcat prefix and suffix rules. Use it to
+add company names, years or site codes to every word in a base dictionary.
 
 ```sh
 rules-generator.py -i tokens.txt -o corp.rule
@@ -299,23 +315,21 @@ rules-generator.py -i tokens.txt --suffix-only --no-comments > suffix.rule
 hashcat -m 1000 hashes.txt base.txt -r corp.rule
 ```
 
-hashcat's `^X` *prepends* and rule functions run left to right, so the prefix
-rule for `corp` is `^p^r^o^c`.
+`^X` prepends a character and rules run left to right, so the prefix rule for
+`corp` is `^p^r^o^c`.
 
-Any printable ASCII character can be an operand, including `#` (only a line
-*starting* with `#` is a comment) and the space (hashcat ignores whitespace
-"unless it is used as a parameter"), so `acme corp` and `#1` both work.
-Tabs, control characters and anything outside ASCII can only be written as
-`\xNN` hex bytes; strings containing them are skipped with a warning unless
-`--hex-escape` is given, because that syntax needs a recent hashcat. Strings
-needing more than `--max-functions` functions (default 31) are skipped
-because hashcat rejects the resulting rule.
-
----
+Strings can contain any printable ASCII character, including spaces and `#`.
+Strings with tabs, control characters or non-ASCII characters are skipped
+with a warning. Pass `--hex-escape` to write those characters as `\xNN`
+bytes, which needs a hashcat version that supports `\xNN` in rules. Strings
+that need more than 31 rule functions are skipped because hashcat rejects
+them. `--max-functions` changes that limit.
 
 ## Workflows
 
-**LM → NT.** LM halves crack almost instantly but give you uppercase only:
+### LM to NT
+
+LM halves crack quickly but only give you the uppercase password.
 
 ```sh
 hashcat -m 3000 lm.txt rockyou.txt --potfile-path lm.pot
@@ -323,8 +337,9 @@ lm-hash-joiner.py lm.pot lm.txt --only-cracked --permute-case -m 3 > cands.txt
 hashcat -m 1000 nt.txt cands.txt
 ```
 
-**Mine what you already cracked.** The passwords you have broken tell you what
-the rest look like:
+### Reuse what you have cracked
+
+Cracked passwords show what the remaining ones are likely to look like.
 
 ```sh
 nt-hash-joiner.py nt.pot domain.ntds --only-cracked > cracked.txt
@@ -334,7 +349,7 @@ rules-generator.py -i parts/numbers.txt --suffix-only --no-comments > numbers.ru
 hashcat -m 1000 nt.txt words.txt -r numbers.rule
 ```
 
-**Targeted base list for one organisation:**
+### Base list for one organisation
 
 ```sh
 multiple-words-joiner.py -i 'mega,corp,2026' --min-words 1 -o base.txt
@@ -343,13 +358,10 @@ sort -u base.txt -o base.txt
 hashcat -m 1000 nt.txt base.txt -r rules/best64.rule
 ```
 
----
-
 ## Option reference
 
-Every flag of every tool, generated from `--help`. A test keeps this
-section in step with the code, so a new flag that is not documented
-here fails CI.
+All flags for each tool, taken from `--help`. A test fails if a flag is
+missing from this file.
 
 ### Generators
 
@@ -543,8 +555,6 @@ here fails CI.
 | `--hex-escape, --allow-unsafe` | Emit strings containing tabs, control characters or non-ASCII characters, writing those as \xNN hex bytes. Needs a hashcat version that supports \xNN in rules; off by default, and such strings are skipped. Spaces and '#' never need this. (--allow-unsafe is the old name for this option.) |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
 
----
-
 ## Development
 
 ```sh
@@ -553,10 +563,10 @@ pytest -q
 ruff check .
 ```
 
-CI byte-compiles every script, lints, runs the tests on Python 3.10–3.13 on
-both Linux and Windows, and compiles the C program checking it against the
-Python one.
+CI compiles every script, runs ruff and the tests on Python 3.10 to 3.13 on
+Linux and Windows, then builds the C program and checks that its output
+matches the Python version.
 
 ## Licence
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
