@@ -26,7 +26,7 @@ for _candidate in (_here, _here.parent):
         sys.path.insert(0, str(_candidate))
         break
 
-from wordlistlib import cli, estimate  # noqa: E402
+from wordlistlib import cli, estimate, parallel  # noqa: E402
 
 #: Most ready-made endings kept in memory. The trailing dictionaries are
 #: multiplied out once into a block of endings, as many dictionaries as fit
@@ -54,13 +54,12 @@ def survey_stream(path: str) -> tuple[int, float]:
     return count, (total / count if count else 0.0)
 
 
-def dictionary_candidates(paths: list[str], rest: list[list[str]],
-                          lead: str, delimiter: str, trail: str):
-    """Yield ``lead + word1 + delimiter + word2 ... + trail`` for every combination.
+def build_tails(rest: list[list[str]], delimiter: str,
+                trail: str) -> tuple[list[list[str]], list[str]]:
+    """Split ``rest`` into ``(middle dictionaries, ready-made endings)``.
 
-    ``rest`` holds the dictionaries after the first, already loaded. The
-    first is read line by line. The last few dictionaries are expanded into
-    one list of endings so the innermost loop is a single concatenation.
+    The last few dictionaries are multiplied out once into a list of
+    endings, so the innermost loop is a single concatenation.
     """
     # Take dictionaries off the end while their product stays small enough.
     # The last one always qualifies: it is in memory already.
@@ -79,15 +78,62 @@ def dictionary_candidates(paths: list[str], rest: list[list[str]],
         ]
     else:
         tails = [trail]
+    return middle, tails
 
+
+def combine(first_words, middle: list[list[str]], tails: list[str],
+            lead: str, delimiter: str):
+    """Yield every candidate that starts with one of ``first_words``."""
+    for first in first_words:
+        if middle:
+            for combo in itertools.product(*middle):
+                head = lead + first + delimiter + delimiter.join(combo)
+                yield from map(head.__add__, tails)
+        else:
+            yield from map((lead + first).__add__, tails)
+
+
+def dictionary_candidates(paths: list[str], rest: list[list[str]],
+                          lead: str, delimiter: str, trail: str):
+    """Yield ``lead + word1 + delimiter + word2 ... + trail`` for every combination.
+
+    ``rest`` holds the dictionaries after the first, already loaded. The
+    first is read line by line.
+    """
+    middle, tails = build_tails(rest, delimiter, trail)
     with cli.open_input(paths[0]) as handle:
-        for first in cli.iter_lines(handle):
-            if middle:
-                for combo in itertools.product(*middle):
-                    head = lead + first + delimiter + delimiter.join(combo)
-                    yield from map(head.__add__, tails)
-            else:
-                yield from map((lead + first).__add__, tails)
+        yield from combine(cli.iter_lines(handle), middle, tails, lead, delimiter)
+
+
+# Per-worker state for --jobs, set once in each worker by start_worker().
+_COMBINE: tuple = ()
+_BOUNDS: tuple[int, int | None] = (0, None)
+
+
+def start_worker(rest, lead, delimiter, trail, min_length, max_length) -> None:
+    global _COMBINE, _BOUNDS
+    middle, tails = build_tails(rest, delimiter, trail)
+    _COMBINE = (middle, tails, lead, delimiter)
+    _BOUNDS = (min_length, max_length)
+
+
+def combine_block(text: str) -> tuple[bytes, int, int]:
+    """Worker: every candidate for one block of the first dictionary."""
+    return parallel.pack_filtered(combine(parallel.lines(text), *_COMBINE), *_BOUNDS)
+
+
+def survey_block(text: str) -> tuple[int, int]:
+    """Worker for the sizing pass: ``(words, total length)`` of a block."""
+    words = parallel.lines(text)
+    return len(words), sum(map(len, words))
+
+
+def survey_parallel(path: str, jobs: int) -> tuple[int, float]:
+    count = total = 0
+    for words, length in parallel.ordered(parallel.input_tasks(path), survey_block, jobs=jobs):
+        count += words
+        total += length
+    return count, (total / count if count else 0.0)
 
 
 def word_candidates(words: list[str], min_words: int, max_words: int,
@@ -153,6 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N", help="Safety limit before --force is required "
                           f"(default {estimate.DEFAULT_MAX_CANDIDATES:,}).",
     )
+    parallel.add_jobs_arg(parser)
     cli.add_common_args(parser)
     cli.add_output_args(parser)
     return parser
@@ -165,6 +212,11 @@ def main() -> None:
     if args.dicts and args.input:
         cli.die("use either -i or -d, not both")
 
+    jobs = parallel.effective_jobs(
+        args.jobs,
+        None if args.dicts else "only dictionary mode (-d) has an input to split up",
+    )
+
     # The affixes join like any other word, so `-p corp -D -` gives
     # corp-mega-2025 rather than corpmega-2025 -- unless told otherwise.
     delimiter = args.delimiter
@@ -176,7 +228,11 @@ def main() -> None:
         if "-" in args.dicts:
             cli.die("-d needs real files, not '-': each dictionary is read "
                     "more than once, which stdin cannot do")
-        size, avg_length = survey_stream(args.dicts[0])
+        if jobs > 1:
+            size, avg_length = survey_parallel(args.dicts[0], jobs)
+        else:
+            size, avg_length = survey_stream(args.dicts[0])
+        first_length = avg_length
         if size == 0:
             cli.die(f"{args.dicts[0]} contains no usable words")
         cli.log(f"{args.dicts[0]}: {size:,} words (streamed)")
@@ -190,6 +246,16 @@ def main() -> None:
             rest.append(words)
         avg_length += len(delimiter) * (len(args.dicts) - 1)
         candidates = dictionary_candidates(args.dicts, rest, lead, delimiter, trail)
+
+        # What one word of the first dictionary turns into. A worker builds
+        # all of that before handing it back, so past a point the serial
+        # path, which streams it, is the only safe one.
+        per_word = total // size
+        per_word_bytes = per_word * (avg_length + len(lead) + len(trail) + 1)
+        if jobs > 1 and per_word_bytes > parallel.MAX_LINE_RESULT_BYTES:
+            cli.warn(f"--jobs ignored: each word of {args.dicts[0]} becomes "
+                     f"{per_word:,} candidates, too many to build in one piece")
+            jobs = 1
     elif args.input:
         words = list(dict.fromkeys(w.strip() for w in args.input.split(",") if w.strip()))
         if not words:
@@ -226,9 +292,26 @@ def main() -> None:
     )
 
     with cli.open_output(args.output, compress=args.gzip) as out:
-        writer = cli.writer_for(out, args)
-        writer.feed(candidates)
-        writer.close()
+        if jobs > 1:
+            # Blocks of the first dictionary sized so that each one's output
+            # is a few megabytes, however large the other dictionaries are.
+            size = max(1, min(
+                parallel.block_bytes(),
+                int(parallel.TARGET_RESULT_BYTES / per_word_bytes * (first_length + 1)),
+            ))
+            writer = parallel.block_writer_for(out, args)
+            parallel.drain(
+                parallel.ordered(
+                    parallel.input_tasks(args.dicts[0], size), combine_block, jobs=jobs,
+                    initializer=start_worker,
+                    initargs=(rest, lead, delimiter, trail, *parallel.length_bounds(args)),
+                ),
+                writer,
+            )
+        else:
+            writer = cli.writer_for(out, args)
+            writer.feed(candidates)
+            writer.close()
 
     cli.log(f"Combinations: {writer.report()}"
             + (f" -> {args.output}" if args.output else ""))

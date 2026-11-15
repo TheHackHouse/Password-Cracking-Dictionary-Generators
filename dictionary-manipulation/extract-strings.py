@@ -25,7 +25,7 @@ for _candidate in (_here, _here.parent):
         sys.path.insert(0, str(_candidate))
         break
 
-from wordlistlib import cli  # noqa: E402
+from wordlistlib import cli, parallel  # noqa: E402
 
 CATEGORIES = ("letters", "short_letters", "numbers", "specials")
 DEFAULT_CATEGORIES = ",".join(CATEGORIES)
@@ -119,6 +119,22 @@ def runs_by_category(lines: list[str], wanted, short_letters_enabled: bool,
     return groups
 
 
+# Per-worker state for --jobs, set once in each worker by start_worker().
+_CONFIG: tuple = ((), False, False)
+
+
+def start_worker(wanted: tuple[str, ...], short_letters_enabled: bool,
+                 unicode_mode: bool) -> None:
+    global _CONFIG
+    _CONFIG = (wanted, short_letters_enabled, unicode_mode)
+
+
+def extract_block(text: str) -> dict[str, tuple[bytes, int]]:
+    """Worker: ``{category: (encoded runs, how many)}`` for one block."""
+    groups = runs_by_category(parallel.lines(text, skip_empty=False), *_CONFIG)
+    return {name: (parallel.pack(runs), len(runs)) for name, runs in groups.items() if runs}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Split strings into letter, digit and special-character runs.",
@@ -155,6 +171,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Treat accented and non-ASCII letters as letters rather than "
              "special characters.",
     )
+    parallel.add_jobs_arg(parser)
     cli.add_common_args(parser, force=False)
     return parser
 
@@ -204,23 +221,46 @@ def main() -> None:
                 cli.die(f"cannot write {path}: {exc}")
             writers[name] = handles[name].write
 
-        with cli.open_input(args.input) as infile:
-            lines = cli.iter_lines(infile, skip_empty=False)
-            while True:
-                batch = list(itertools.islice(lines, cli.DEFAULT_CHUNK_SIZE))
-                if not batch:
-                    break
-                groups = runs_by_category(batch, selected, short_enabled, args.unicode)
-                for name, runs in groups.items():
-                    if not runs:
-                        continue
-                    counts[name] += len(runs)
-                    write = writers.get(name)
-                    if write is None:
-                        collected.update(runs)
-                    else:
-                        write("\n".join(runs))
-                        write("\n")
+        jobs = parallel.effective_jobs(
+            args.jobs,
+            "sorted output to stdout is collected in one process; write to a "
+            "file, or add --no-sort" if collected is not None else None,
+        )
+        if jobs > 1:
+            # Workers return each category already encoded, so all that is
+            # left to do here is append the bytes to the right file.
+            sinks = {}
+            for name in selected:
+                handle = handles.get(name) or cli.stdout()
+                handle.flush()
+                sinks[name] = handle.buffer.write
+            results = parallel.ordered(
+                parallel.input_tasks(args.input), extract_block, jobs=jobs,
+                initializer=start_worker,
+                initargs=(tuple(selected), short_enabled, args.unicode),
+            )
+            for groups in results:
+                for name, (data, count) in groups.items():
+                    counts[name] += count
+                    sinks[name](data)
+        else:
+            with cli.open_input(args.input) as infile:
+                lines = cli.iter_lines(infile, skip_empty=False)
+                while True:
+                    batch = list(itertools.islice(lines, cli.DEFAULT_CHUNK_SIZE))
+                    if not batch:
+                        break
+                    groups = runs_by_category(batch, selected, short_enabled, args.unicode)
+                    for name, runs in groups.items():
+                        if not runs:
+                            continue
+                        counts[name] += len(runs)
+                        write = writers.get(name)
+                        if write is None:
+                            collected.update(runs)
+                        else:
+                            write("\n".join(runs))
+                            write("\n")
     finally:
         for handle in handles.values():
             handle.close()

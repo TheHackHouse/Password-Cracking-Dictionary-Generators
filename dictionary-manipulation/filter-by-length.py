@@ -18,7 +18,20 @@ for _candidate in (_here, _here.parent):
         sys.path.insert(0, str(_candidate))
         break
 
-from wordlistlib import cli  # noqa: E402
+from wordlistlib import cli, parallel  # noqa: E402
+
+# Per-worker state for --jobs, set once in each worker by start_worker().
+_BOUNDS: tuple[int, int | None] = (1, None)
+
+
+def start_worker(min_length: int, max_length: int | None) -> None:
+    global _BOUNDS
+    _BOUNDS = (min_length, max_length)
+
+
+def filter_block(text: str) -> tuple[bytes, int, int]:
+    """Worker: the lines of one block that are inside the length range."""
+    return parallel.pack_filtered(parallel.lines(text), *_BOUNDS)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -45,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--sort", action="store_true",
         help="Sort and deduplicate the output. Requires -o.",
     )
+    parallel.add_jobs_arg(parser)
     cli.add_common_args(parser, force=False)
     return parser
 
@@ -60,13 +74,27 @@ def main() -> None:
     if args.sort and args.output in (None, "-"):
         cli.die("--sort needs -o/--output with a file (it rewrites the file in place)")
 
-    with cli.open_input(args.input) as infile, cli.open_output(args.output) as outfile:
-        # The writer does the length test a block of lines at a time, so
-        # there is no per-line Python loop anywhere on this path.
-        writer = cli.CandidateWriter(
-            outfile, min_length=args.min_length, max_length=args.max_length
-        )
-        kept = writer.feed(cli.iter_lines(infile))
+    jobs = parallel.resolve_jobs(args.jobs)
+    if jobs > 1:
+        with cli.open_output(args.output) as outfile:
+            writer = parallel.BlockWriter(outfile)
+            parallel.drain(
+                parallel.ordered(
+                    parallel.input_tasks(args.input), filter_block, jobs=jobs,
+                    initializer=start_worker,
+                    initargs=(args.min_length, args.max_length),
+                ),
+                writer,
+            )
+        kept = writer.written
+    else:
+        with cli.open_input(args.input) as infile, cli.open_output(args.output) as outfile:
+            # The writer does the length test a block of lines at a time, so
+            # there is no per-line Python loop anywhere on this path.
+            writer = cli.CandidateWriter(
+                outfile, min_length=args.min_length, max_length=args.max_length
+            )
+            kept = writer.feed(cli.iter_lines(infile))
     read = kept + writer.filtered
 
     if args.sort:

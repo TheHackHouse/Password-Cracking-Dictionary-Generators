@@ -23,7 +23,27 @@ for _candidate in (_here, _here.parent):
         sys.path.insert(0, str(_candidate))
         break
 
-from wordlistlib import cli, vocab  # noqa: E402
+from wordlistlib import cli, parallel, vocab  # noqa: E402
+
+# Per-worker state for --jobs, set once in each worker by start_worker().
+_VOCABULARY: frozenset[str] | set[str] = frozenset()
+_INVERT = False
+_SPLIT_WORDS = False
+
+
+def start_worker(vocabulary, invert: bool, split_words: bool) -> None:
+    global _VOCABULARY, _INVERT, _SPLIT_WORDS
+    _VOCABULARY, _INVERT, _SPLIT_WORDS = vocabulary, invert, split_words
+
+
+def compare_block(text: str) -> tuple[bytes, int, int, int, int]:
+    """Worker: ``(output, written, 0, checked, matched)`` for one block."""
+    # Splitting the whole block on whitespace gives the same tokens as
+    # splitting each line, since a line break is whitespace too.
+    tokens = text.split() if _SPLIT_WORDS else parallel.lines(text)
+    wanted = [t for t in tokens if (t.lower() in _VOCABULARY) == _INVERT]
+    matched = len(wanted) if _INVERT else len(tokens) - len(wanted)
+    return parallel.pack(wanted), len(wanted), 0, len(tokens), matched
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -52,6 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Treat each whitespace-separated token as a word. By default a "
              "whole line is one word, which is what you want for a password list.",
     )
+    parallel.add_jobs_arg(parser)
     cli.add_common_args(parser, force=False)
     return parser
 
@@ -62,6 +83,35 @@ def main() -> None:
 
     vocabulary = vocab.load(args.custom_dict)
 
+    jobs = parallel.resolve_jobs(args.jobs)
+    if jobs > 1:
+        checked, matched = parallel_compare(args, vocabulary, jobs)
+    else:
+        checked, matched = serial_compare(args, vocabulary)
+
+    wanted = "dictionary words" if args.invert else "non-dictionary words"
+    cli.log(
+        f"Checked {checked:,} entries: {matched:,} in the dictionary, "
+        f"{checked - matched:,} not. Wrote the {wanted}."
+    )
+
+
+def parallel_compare(args, vocabulary, jobs: int) -> tuple[int, int]:
+    totals = [0, 0]                       # checked, matched
+    with cli.open_output(args.output) as outfile:
+        parallel.drain(
+            parallel.ordered(
+                parallel.input_tasks(args.input), compare_block, jobs=jobs,
+                initializer=start_worker,
+                initargs=(vocabulary, args.invert, args.split_words),
+            ),
+            parallel.BlockWriter(outfile),
+            totals,
+        )
+    return totals[0], totals[1]
+
+
+def serial_compare(args, vocabulary) -> tuple[int, int]:
     checked = matched = 0
     invert = args.invert
     with cli.open_input(args.input) as infile, cli.open_output(args.output) as outfile:
@@ -81,12 +131,7 @@ def main() -> None:
             if wanted_tokens:
                 outfile.write("\n".join(wanted_tokens))
                 outfile.write("\n")
-
-    wanted = "dictionary words" if args.invert else "non-dictionary words"
-    cli.log(
-        f"Checked {checked:,} entries: {matched:,} in the dictionary, "
-        f"{checked - matched:,} not. Wrote the {wanted}."
-    )
+    return checked, matched
 
 
 if __name__ == "__main__":

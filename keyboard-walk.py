@@ -23,7 +23,7 @@ for _candidate in (_here, _here.parent):
         sys.path.insert(0, str(_candidate))
         break
 
-from wordlistlib import cli, estimate  # noqa: E402
+from wordlistlib import cli, estimate, parallel  # noqa: E402
 
 LAYOUTS: dict[str, list[list[str]]] = {
     "qwerty": [
@@ -131,17 +131,22 @@ def adjacency_for(layout: str) -> dict[str, list[str]]:
     return build_adjacency(rows, NUMBER_ROWS.get(layout, 0))
 
 
-def count_walks(adjacency: dict[str, list[str]], length: int) -> int:
-    """Number of walks of ``length`` keys, without generating any of them."""
-    if length <= 0:
-        return 0
+def continuation_counts(adjacency: dict[str, list[str]], keys: int) -> dict[str, int]:
+    """For each key, how many ways there are to walk on for ``keys`` more keys."""
     counts = {key: 1 for key in adjacency}
-    for _ in range(length - 1):
+    for _ in range(keys):
         counts = {
             key: sum(counts[n] for n in neighbours)
             for key, neighbours in adjacency.items()
         }
-    return sum(counts.values())
+    return counts
+
+
+def count_walks(adjacency: dict[str, list[str]], length: int) -> int:
+    """Number of walks of ``length`` keys, without generating any of them."""
+    if length <= 0:
+        return 0
+    return sum(continuation_counts(adjacency, length - 1).values())
 
 
 #: Keys of each walk that are precomputed as a block. Every way of continuing
@@ -164,15 +169,40 @@ def walks(adjacency: dict[str, list[str]], length: int):
     if length == 1:
         yield from adjacency
         return
+    tails = tail_table(adjacency, min(TAIL_KEYS, length - 1))
+    for key in adjacency:
+        yield from walks_from(adjacency, key, length, tails)
 
-    tail_keys = min(TAIL_KEYS, length - 1)
-    # tails[key]: every continuation of tail_keys keys after ``key``.
+
+def tail_table(adjacency: dict[str, list[str]], keys: int) -> dict[str, list[str]]:
+    """For each key, every continuation of ``keys`` keys after it, in walk order."""
     tails = {key: [""] for key in adjacency}
-    for _ in range(tail_keys):
+    for _ in range(keys):
         tails = {
             key: [n + rest for n in neighbours for rest in tails[n]]
             for key, neighbours in adjacency.items()
         }
+    return tails
+
+
+def walks_from(adjacency: dict[str, list[str]], prefix: str, length: int,
+               tails: dict[str, list[str]] | None = None):
+    """Yield the walks of ``length`` keys that begin with the walk ``prefix``.
+
+    Doing this for every prefix of some fixed length, in walk order, gives
+    exactly ``walks(adjacency, length)``; that is how --jobs divides the
+    work. ``tails`` is the table for ``min(TAIL_KEYS, keys still to add)``,
+    passed in so it is not rebuilt for each prefix.
+    """
+    remaining = length - len(prefix)
+    if remaining < 0:
+        return
+    if remaining == 0:
+        yield prefix
+        return
+    tail_keys = min(TAIL_KEYS, remaining)
+    if tails is None:
+        tails = tail_table(adjacency, tail_keys)
 
     def step(prefix: str, key: str, remaining: int):
         if remaining == 0:
@@ -181,8 +211,46 @@ def walks(adjacency: dict[str, list[str]], length: int):
         for neighbour in adjacency[key]:
             yield from step(prefix + neighbour, neighbour, remaining - 1)
 
-    for key in adjacency:
-        yield from step(key, key, length - 1 - tail_keys)
+    yield from step(prefix, prefix[-1], remaining - tail_keys)
+
+
+def split_depth(adjacency: dict[str, list[str]], length: int, jobs: int) -> int:
+    """How many leading keys to fix so the walks divide into worker-sized pieces.
+
+    Each walk of that many keys becomes one task: "generate every walk that
+    starts like this". The depth is the shallowest at which the largest task
+    produces a few megabytes at most and there are enough tasks to keep
+    every worker busy.
+    """
+    target = parallel.block_bytes(parallel.TARGET_RESULT_BYTES)
+    for depth in range(1, length):
+        largest = max(continuation_counts(adjacency, length - depth).values())
+        if largest * (length + 1) <= target and count_walks(adjacency, depth) >= 4 * jobs:
+            return depth
+    return length
+
+
+# Per-worker state for --jobs, set once in each worker by start_worker().
+_ADJACENCY: dict[str, list[str]] = {}
+_LENGTH = 0
+_TAILS: dict[str, list[str]] = {}
+_BOUNDS: tuple[int, int | None] = (0, None)
+
+
+def start_worker(layout: str, length: int, depth: int, min_length: int,
+                 max_length: int | None) -> None:
+    global _ADJACENCY, _LENGTH, _TAILS, _BOUNDS
+    _ADJACENCY = adjacency_for(layout)
+    _LENGTH = length
+    _TAILS = tail_table(_ADJACENCY, min(TAIL_KEYS, length - depth))
+    _BOUNDS = (min_length, max_length)
+
+
+def walk_block(prefix: str) -> tuple[bytes, int, int]:
+    """Worker: every walk that starts with ``prefix``."""
+    return parallel.pack_filtered(
+        walks_from(_ADJACENCY, prefix, _LENGTH, _TAILS), *_BOUNDS
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -206,6 +274,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N", help="Safety limit before --force is required "
                           f"(default {estimate.DEFAULT_MAX_CANDIDATES:,}).",
     )
+    parallel.add_jobs_arg(parser)
     cli.add_common_args(parser)
     cli.add_output_args(parser)
     return parser
@@ -229,10 +298,39 @@ def main() -> None:
         label="walks",
     )
 
+    jobs = parallel.resolve_jobs(args.jobs)
     with cli.open_output(args.output, compress=args.gzip) as out:
-        writer = cli.writer_for(out, args)
-        writer.feed(walks(adjacency, args.length))
-        writer.close()
+        if jobs > 1:
+            writer = parallel.block_writer_for(out, args)
+            min_length, max_length = parallel.length_bounds(args)
+            depth = split_depth(adjacency, args.length, jobs)
+            per_prefix = continuation_counts(adjacency, args.length - depth)
+            # Every walk has the same length, so the length filter passes
+            # all of them or none; when it passes, a --skip can jump whole
+            # pieces without generating them, because their sizes are known.
+            kept = args.length >= min_length and (
+                max_length is None or args.length <= max_length)
+
+            def prefixes():
+                skipping = kept
+                for prefix in walks(adjacency, depth):
+                    if skipping and writer.skip_ahead(per_prefix[prefix[-1]]):
+                        continue
+                    skipping = False
+                    yield prefix
+
+            parallel.drain(
+                parallel.ordered(
+                    parallel.item_tasks(prefixes()), walk_block, jobs=jobs,
+                    initializer=start_worker,
+                    initargs=(args.layout, args.length, depth, min_length, max_length),
+                ),
+                writer,
+            )
+        else:
+            writer = cli.writer_for(out, args)
+            writer.feed(walks(adjacency, args.length))
+            writer.close()
 
     cli.log(f"Walks: {writer.report()}"
             + (f" -> {args.output}" if args.output else ""))

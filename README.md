@@ -18,6 +18,7 @@ Every tool follows the same conventions, so they pipe together:
 | `-o`, `--output` | output file; **defaults to stdout** |
 | `-q`, `--quiet` | suppress progress and statistics |
 | `--force` | skip the size confirmation prompt (for scripted runs) |
+| `-j`, `--jobs N` | worker processes; `0` means one per CPU core |
 
 Candidates go to **stdout**; counts, warnings and prompts go to **stderr**.
 `tool ... > list.txt` therefore always produces a clean wordlist.
@@ -41,6 +42,54 @@ size the job and once to generate, so words piped on stdin are kept instead.
 Sorting uses the system `sort -u` when there is one and an in-process
 external merge sort when there is not (plain Windows), neither of which
 needs the file to fit in memory.
+
+## Using more than one core
+
+The tools that work through a list line by line take `-j/--jobs N`:
+
+```sh
+swapcase.py -i huge.txt --keep-duplicates -j 0 -o swapped.txt     # every core
+dict-extractor.py -i cracked.txt -j 16 --known-out words.txt --remaining-out rest.txt
+keyboard-walk.py -l 9 -j 16 -o walks9.txt
+```
+
+The output is byte-for-byte what a single process produces, in the same
+order, so `--jobs` is purely a speed setting and `--skip`/`--limit` slices
+line up across machines whatever each one's core count. The input is cut
+into blocks on line boundaries, each block goes to a worker, and the results
+are written back in order.
+
+| tool | what is split up |
+|---|---|
+| `swapcase.py` | the input list (needs `--keep-duplicates`) |
+| `filter-by-length.py`, `dict-compare.py`, `extract-strings.py`, `dict-extractor.py` | the input list |
+| `nt-hash-joiner.py`, `lm-hash-joiner.py` | the hash file (not with `--unique`) |
+| `case-permutation.py` | the word list given with `-i FILE` |
+| `multiple-words-joiner.py` | the first dictionary (`-d` mode) |
+| `keyboard-walk.py` | the walks, by their opening keys |
+
+Things worth knowing:
+
+- **It pays off on large jobs.** Starting the workers costs a fraction of a
+  second each, so a list of a few megabytes is quicker with one process. On a
+  2 GB list, 16 workers ran these tools 7 to 16 times faster.
+- **The disk becomes the limit.** One process writes the output, in order.
+  Past roughly 1 GB/s of output, more workers do not help.
+- **Memory grows with the worker count**, not with the input: 30 to 60 MB per
+  worker for the list tools. Workers each hold their own copy of anything
+  the tool loads up front — the pot file, the reference word list, the second
+  and later dictionaries — so a multi-gigabyte pot file with 32 workers needs
+  32 copies' worth.
+- **Some jobs cannot be split** and say so, then run in one process: anything
+  that drops duplicates (it has to see every line), `case-permutation.py`
+  reading stdin, and a single word or dictionary entry whose expansion alone
+  is too large to build in one piece.
+- Plain files are read by the workers themselves. stdin and `.gz` inputs
+  cannot be read from the middle, so one process reads them and hands the
+  blocks out, which is slower but still parallel.
+- `keyboard-walk.py --skip N` with `--jobs` jumps straight to the right place
+  rather than generating and discarding, because the size of every piece is
+  known in advance.
 
 ## Install
 
@@ -385,6 +434,7 @@ here fails CI.
 | `--positions N` | With --rules, how many character positions to toggle (default: the length of the longest input word). hashcat can address 36 positions. |
 | `--common` | Skip the full permutation and emit only lower, UPPER, Capitalised, swapped and Title case. |
 | `--max-candidates N` | Safety limit before --force is required (default 50,000,000). |
+| `-j, --jobs N` | Worker processes to use (default: 1). 0 means one per CPU core. The output is the same, in the same order, whatever the value. |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
 | `--force` | Skip the size confirmation prompt (for scripted runs). |
 | `--min-length N` | Drop candidates shorter than N characters before writing them. |
@@ -401,6 +451,7 @@ here fails CI.
 | `-o, --output OUTPUT` | Output file. Defaults to stdout. |
 | `-k, --layout {azerty,dvorak,qwerty,qwertyshifted,qwertyshifted1,qwertyshifted2}` | Keyboard layout (default: qwerty). |
 | `--max-candidates N` | Safety limit before --force is required (default 50,000,000). |
+| `-j, --jobs N` | Worker processes to use (default: 1). 0 means one per CPU core. The output is the same, in the same order, whatever the value. |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
 | `--force` | Skip the size confirmation prompt (for scripted runs). |
 | `--min-length N` | Drop candidates shorter than N characters before writing them. |
@@ -423,6 +474,7 @@ here fails CI.
 | `--min-words N` | With -i, the fewest words per candidate (default: all of them, or 1 when --max-words is given). |
 | `--max-words N` | With -i, the most words per candidate (default: all of them). |
 | `--max-candidates N` | Safety limit before --force is required (default 50,000,000). |
+| `-j, --jobs N` | Worker processes to use (default: 1). 0 means one per CPU core. The output is the same, in the same order, whatever the value. |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
 | `--force` | Skip the size confirmation prompt (for scripted runs). |
 | `--min-length N` | Drop candidates shorter than N characters before writing them. |
@@ -439,6 +491,7 @@ here fails CI.
 | `-o, --output OUTPUT` | Output file. Defaults to stdout. |
 | `-m, --mode {capitalize,lower,swap,title,upper}` | Transformation to apply (default: swap). |
 | `--keep-duplicates` | Do not drop candidates that are duplicates of each other (e.g. two inputs that upper-case to the same string). Dropping them means remembering every distinct output, so use this for lists larger than memory and run sort -u afterwards. |
+| `-j, --jobs N` | Worker processes to use (default: 1). 0 means one per CPU core. The output is the same, in the same order, whatever the value. |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
 | `--min-length N` | Drop candidates shorter than N characters before writing them. |
 | `--max-length N` | Drop candidates longer than N characters before writing them. |
@@ -458,6 +511,7 @@ here fails CI.
 | `--permute-case` | Also emit case permutations of each recovered password. LM is case-insensitive, so this is what makes the output usable against the matching NT hashes. |
 | `-m, --max-upper N` | With --permute-case, uppercase at most N characters per candidate. Strongly recommended: without it a 14-character password expands to 16,384 candidates. |
 | `--unique` | Write each distinct line once. Accounts that share a password otherwise repeat it. Holds the distinct lines in memory. |
+| `-j, --jobs N` | Worker processes to use (default: 1). 0 means one per CPU core. The output is the same, in the same order, whatever the value. |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
 | `--min-length N` | Drop candidates shorter than N characters before writing them. |
 | `--max-length N` | Drop candidates longer than N characters before writing them. |
@@ -474,6 +528,7 @@ here fails CI.
 | `--user-pass` | Emit 'username:plaintext'. Needs input lines that carry a username (dump lines or user:hash). |
 | `--only-cracked` | Omit uncracked entries instead of emitting <HASH_NOT_FOUND>. |
 | `--unique` | Write each distinct line once. Accounts that share a password otherwise repeat it. Holds the distinct lines in memory. |
+| `-j, --jobs N` | Worker processes to use (default: 1). 0 means one per CPU core. The output is the same, in the same order, whatever the value. |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
 | `--min-length N` | Drop candidates shorter than N characters before writing them. |
 | `--max-length N` | Drop candidates longer than N characters before writing them. |
@@ -493,6 +548,7 @@ here fails CI.
 | `--categories CATEGORIES` | Comma separated subset of: letters, short_letters, numbers, specials (default: all). 'short_letters' splits runs of 1-2 letters out of 'letters'. |
 | `--no-sort` | Leave output in input order instead of sorting and deduplicating. |
 | `--unicode` | Treat accented and non-ASCII letters as letters rather than special characters. |
+| `-j, --jobs N` | Worker processes to use (default: 1). 0 means one per CPU core. The output is the same, in the same order, whatever the value. |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
 
 **dict-extractor.py**
@@ -505,6 +561,7 @@ here fails CI.
 | `--custom-dict, --custom_dict CUSTOM_DICT` | Reference word list. Without it the NLTK corpus is used, falling back to the system word list. |
 | `--min-word-length N` | Shortest substring treated as a word (default: 4). Lower values match far more aggressively and produce noisier output. |
 | `--no-sort` | Leave output in input order instead of sorting and deduplicating. |
+| `-j, --jobs N` | Worker processes to use (default: 1). 0 means one per CPU core. The output is the same, in the same order, whatever the value. |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
 
 **dict-compare.py**
@@ -516,6 +573,7 @@ here fails CI.
 | `--custom-dict, --custom_dict CUSTOM_DICT` | Reference word list to compare against. Without it the NLTK corpus is used, falling back to the system word list. |
 | `--invert` | Emit the words that ARE in the dictionary rather than the ones that are not. |
 | `--split-words` | Treat each whitespace-separated token as a word. By default a whole line is one word, which is what you want for a password list. |
+| `-j, --jobs N` | Worker processes to use (default: 1). 0 means one per CPU core. The output is the same, in the same order, whatever the value. |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
 
 **filter-by-length.py**
@@ -527,6 +585,7 @@ here fails CI.
 | `--min-length N` | Shortest length to keep (default: 1). |
 | `--max-length N` | Longest length to keep (default: no limit). |
 | `--sort` | Sort and deduplicate the output. Requires -o. |
+| `-j, --jobs N` | Worker processes to use (default: 1). 0 means one per CPU core. The output is the same, in the same order, whatever the value. |
 | `-q, --quiet` | Suppress progress and statistics on stderr. |
 
 **rules-generator.py**

@@ -21,7 +21,7 @@ for _candidate in (_here, _here.parent):
         sys.path.insert(0, str(_candidate))
         break
 
-from wordlistlib import cli  # noqa: E402
+from wordlistlib import cli, parallel  # noqa: E402
 
 MODES = {
     "swap": str.swapcase,
@@ -30,6 +30,21 @@ MODES = {
     "title": str.title,
     "capitalize": str.capitalize,
 }
+
+# Per-worker state for --jobs, set once in each worker by start_worker().
+_TRANSFORM = str.swapcase
+_BOUNDS: tuple[int, int | None] = (0, None)
+
+
+def start_worker(mode: str, min_length: int, max_length: int | None) -> None:
+    global _TRANSFORM, _BOUNDS
+    _TRANSFORM = MODES[mode]
+    _BOUNDS = (min_length, max_length)
+
+
+def transform_block(text: str) -> tuple[bytes, int, int]:
+    """Worker: one block of words, transformed and length-filtered."""
+    return parallel.pack_filtered(map(_TRANSFORM, parallel.lines(text)), *_BOUNDS)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -61,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
              "means remembering every distinct output, so use this for lists "
              "larger than memory and run sort -u afterwards.",
     )
+    parallel.add_jobs_arg(parser)
     cli.add_common_args(parser, force=False)
     cli.add_output_args(parser)
     return parser
@@ -84,17 +100,36 @@ def main() -> None:
                 add(candidate)
                 yield candidate
 
-    with cli.open_input(args.input) as infile, \
-            cli.open_output(args.output, compress=args.gzip) as outfile:
-        # map() keeps the transform itself out of the Python loop. With
-        # --keep-duplicates nothing is remembered, so the whole run is
-        # streaming and the input can be any size.
-        candidates = map(transform, cli.iter_lines(infile))
-        if not args.keep_duplicates:
-            candidates = distinct(candidates)
-        writer = cli.writer_for(outfile, args)
-        writer.feed(candidates)
-        writer.close()
+    jobs = parallel.effective_jobs(
+        args.jobs,
+        None if args.keep_duplicates else
+        "dropping duplicates needs one process to see every word; add "
+        "--keep-duplicates and run sort -u on the result",
+    )
+
+    if jobs > 1:
+        with cli.open_output(args.output, compress=args.gzip) as outfile:
+            writer = parallel.block_writer_for(outfile, args)
+            parallel.drain(
+                parallel.ordered(
+                    parallel.input_tasks(args.input), transform_block, jobs=jobs,
+                    initializer=start_worker,
+                    initargs=(args.mode, *parallel.length_bounds(args)),
+                ),
+                writer,
+            )
+    else:
+        with cli.open_input(args.input) as infile, \
+                cli.open_output(args.output, compress=args.gzip) as outfile:
+            # map() keeps the transform itself out of the Python loop. With
+            # --keep-duplicates nothing is remembered, so the whole run is
+            # streaming and the input can be any size.
+            candidates = map(transform, cli.iter_lines(infile))
+            if not args.keep_duplicates:
+                candidates = distinct(candidates)
+            writer = cli.writer_for(outfile, args)
+            writer.feed(candidates)
+            writer.close()
 
     read = writer.written + writer.filtered + writer.skipped + duplicates
     cli.log(f"Read {read:,} words with mode '{args.mode}': {writer.report()}"

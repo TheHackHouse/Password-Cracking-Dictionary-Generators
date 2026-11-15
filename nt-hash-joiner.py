@@ -17,6 +17,7 @@ clean wordlist.
 from __future__ import annotations
 
 import argparse
+import itertools
 import re
 import sys
 from pathlib import Path
@@ -27,7 +28,7 @@ for _candidate in (_here, _here.parent):
         sys.path.insert(0, str(_candidate))
         break
 
-from wordlistlib import cli  # noqa: E402
+from wordlistlib import cli, parallel  # noqa: E402
 
 #: NT hash of the empty string. A match means a blank password, not a miss.
 BLANK_NT = "31D6CFE0D16AE931B73C59D7E0C089C0"
@@ -114,53 +115,97 @@ def parse_line(line: str) -> tuple[str, str | None, list[str] | None, int]:
     return "", None, None, 0
 
 
-def process(hash_file: str, pot: dict[str, str], args):
-    """Yield output lines, streaming rather than buffering the whole result."""
+def join_lines(lines, pot: dict[str, str], only_cracked: bool, user_pass: bool,
+               full: bool) -> tuple[list[str], tuple[int, int, int, int, int]]:
+    """Resolve a batch of hash-file lines.
+
+    Returns the output lines, in order, and the counters
+    ``(skipped, cracked, blank, missing, no_username)``. It depends on
+    nothing but its arguments, which is what lets --jobs hand batches to
+    separate processes.
+    """
     # Plain local counters and flags: this loop runs once per line of a dump
     # that can be millions of lines long.
     skipped = cracked = blank = missing = no_username = 0
     lookup = pot.get
-    only_cracked, user_pass, full = args.only_cracked, args.user_pass, args.full
     report = full or user_pass
+    out: list[str] = []
+    emit = out.append
 
-    with cli.open_input(hash_file) as handle:
-        for line in cli.iter_lines(handle):
-            nt_hash, username, fields, index = parse_line(line)
-            if not nt_hash:
-                skipped += 1
+    for line in lines:
+        nt_hash, username, fields, index = parse_line(line)
+        if not nt_hash:
+            skipped += 1
+            continue
+
+        plaintext = lookup(nt_hash)
+        if plaintext is not None:
+            cracked += 1
+        elif nt_hash == BLANK_NT:
+            blank += 1
+            # A blank password is a real finding but not a wordlist
+            # candidate, so the marker is for the report formats only.
+            if not report:
                 continue
+            plaintext = BLANK_PASSWORD
+        else:
+            missing += 1
+            if only_cracked:
+                continue
+            plaintext = NOT_FOUND
 
-            plaintext = lookup(nt_hash)
-            if plaintext is not None:
-                cracked += 1
-            elif nt_hash == BLANK_NT:
-                blank += 1
-                # A blank password is a real finding but not a wordlist
-                # candidate, so the marker is for the report formats only.
-                if not report:
-                    continue
-                plaintext = BLANK_PASSWORD
+        if user_pass:
+            if username is None:
+                no_username += 1
+                emit(plaintext)
             else:
-                missing += 1
-                if only_cracked:
-                    continue
-                plaintext = NOT_FOUND
-
-            if user_pass:
-                if username is None:
-                    no_username += 1
-                    yield plaintext
-                else:
-                    yield f"{username}:{plaintext}"
-            elif full:
-                if fields is not None:
-                    fields[index] = plaintext
-                    yield ":".join(fields)
-                else:
-                    yield f"{nt_hash}:{plaintext}"
+                emit(f"{username}:{plaintext}")
+        elif full:
+            if fields is not None:
+                fields[index] = plaintext
+                emit(":".join(fields))
             else:
-                yield plaintext
+                emit(f"{nt_hash}:{plaintext}")
+        else:
+            emit(plaintext)
 
+    return out, (skipped, cracked, blank, missing, no_username)
+
+
+# Per-worker state for --jobs, set once in each worker by start_worker().
+_JOIN: tuple = ()
+_BOUNDS: tuple[int, int | None] = (0, None)
+
+
+def start_worker(pot, only_cracked, user_pass, full, min_length, max_length) -> None:
+    global _JOIN, _BOUNDS
+    _JOIN = (pot, only_cracked, user_pass, full)
+    _BOUNDS = (min_length, max_length)
+
+
+def join_block(text: str) -> tuple:
+    """Worker: ``(output, written, filtered, *counters)`` for one block."""
+    out, counters = join_lines(parallel.lines(text), *_JOIN)
+    return (*parallel.pack_filtered(out, *_BOUNDS), *counters)
+
+
+def process(hash_file: str, pot: dict[str, str], args, totals: list[int]):
+    """Yield output lines a batch at a time, adding the counters to ``totals``."""
+    flags = (args.only_cracked, args.user_pass, args.full)
+    with cli.open_input(hash_file) as handle:
+        source = cli.iter_lines(handle)
+        while True:
+            batch = list(itertools.islice(source, cli.DEFAULT_CHUNK_SIZE))
+            if not batch:
+                break
+            out, counters = join_lines(batch, pot, *flags)
+            for index, value in enumerate(counters):
+                totals[index] += value
+            yield from out
+
+
+def report_totals(totals: list[int]) -> None:
+    skipped, cracked, blank, missing, no_username = totals
     if no_username:
         cli.warn(
             f"--user-pass: {no_username:,} line(s) had no username; "
@@ -217,6 +262,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write each distinct line once. Accounts that share a password "
              "otherwise repeat it. Holds the distinct lines in memory.",
     )
+    parallel.add_jobs_arg(parser)
     cli.add_common_args(parser, force=False)
     cli.add_output_args(parser)
     return parser
@@ -227,16 +273,33 @@ def main() -> None:
     cli.set_quiet(args.quiet)
 
     pot = load_pot_file(args.pot_file)
-
-    results = process(args.hash_file, pot, args)
-    if args.unique:
-        results = cli.unique(results)
+    totals = [0, 0, 0, 0, 0]          # skipped, cracked, blank, missing, no_username
+    jobs = parallel.effective_jobs(
+        args.jobs,
+        "--unique needs one process to see every line" if args.unique else None,
+    )
 
     with cli.open_output(args.output, compress=args.gzip) as out:
-        writer = cli.writer_for(out, args)
-        writer.feed(results)
-        writer.close()
+        if jobs > 1:
+            writer = parallel.block_writer_for(out, args)
+            parallel.drain(
+                parallel.ordered(
+                    parallel.input_tasks(args.hash_file), join_block, jobs=jobs,
+                    initializer=start_worker,
+                    initargs=(pot, args.only_cracked, args.user_pass, args.full,
+                              *parallel.length_bounds(args)),
+                ),
+                writer, totals,
+            )
+        else:
+            results = process(args.hash_file, pot, args, totals)
+            if args.unique:
+                results = cli.unique(results)
+            writer = cli.writer_for(out, args)
+            writer.feed(results)
+            writer.close()
 
+    report_totals(totals)
     cli.log(f"Output: {writer.report()}"
             + (f" -> {args.output}" if args.output else ""))
 

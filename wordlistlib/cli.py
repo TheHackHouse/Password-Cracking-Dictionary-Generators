@@ -63,8 +63,14 @@ def _reconfigure(stream, **options) -> None:
 
 
 def stdin():
-    """``sys.stdin`` as UTF-8, whatever the platform's locale says."""
-    _reconfigure(sys.stdin, encoding="utf-8", errors=ENCODING_ERRORS)
+    """``sys.stdin`` as UTF-8, whatever the platform's locale says.
+
+    ``newline=None`` asks for universal newlines, which is what a file opened
+    for reading gets. Without it stdin on Linux and macOS only splits on
+    ``\\n``, so a list with old Mac line endings would read differently
+    piped in than it does given with ``-i``.
+    """
+    _reconfigure(sys.stdin, encoding="utf-8", errors=ENCODING_ERRORS, newline=None)
     return sys.stdin
 
 

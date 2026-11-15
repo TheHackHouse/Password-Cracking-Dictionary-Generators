@@ -15,6 +15,7 @@ found.
 from __future__ import annotations
 
 import argparse
+import itertools
 import sys
 from pathlib import Path
 
@@ -24,7 +25,7 @@ for _candidate in (_here, _here.parent):
         sys.path.insert(0, str(_candidate))
         break
 
-from wordlistlib import cli, vocab  # noqa: E402
+from wordlistlib import cli, parallel, vocab  # noqa: E402
 
 
 def word_starts(vocabulary: set[str], min_length: int) -> frozenset[str]:
@@ -99,6 +100,51 @@ def split_into_words(
     return spans
 
 
+def decompose(lines, vocabulary, min_length: int, longest_word: int,
+              starts) -> tuple[list[str], list[str], int]:
+    """Split each line: ``(words found, leftovers, lines that held a word)``.
+
+    Both lists are in input order. Each stretch between words is its own
+    leftover, so 'acme2026summer!' leaves '2026' and '!', not '2026!'. A
+    line with no word in it is a leftover whole.
+    """
+    known: list[str] = []
+    remaining: list[str] = []
+    split_count = 0
+    for line in lines:
+        spans = split_into_words(line, vocabulary, min_length, longest_word, starts)
+        if not spans:
+            remaining.append(line)
+            continue
+        split_count += 1
+        position = 0
+        for start, end in spans:
+            if start > position:
+                remaining.append(line[position:start])
+            known.append(line[start:end])
+            position = end
+        if position < len(line):
+            remaining.append(line[position:])
+    return known, remaining, split_count
+
+
+# Per-worker state for --jobs, set once in each worker by start_worker().
+_MATCHER: tuple = ()
+
+
+def start_worker(vocabulary, min_length: int, longest_word: int, starts) -> None:
+    global _MATCHER
+    _MATCHER = (vocabulary, min_length, longest_word, starts)
+
+
+def decompose_block(text: str) -> tuple[bytes, bytes, tuple[int, int, int, int]]:
+    """Worker: encoded words, encoded leftovers and the counters for a block."""
+    lines = parallel.lines(text)
+    known, remaining, split_count = decompose(lines, *_MATCHER)
+    counts = (len(lines), split_count, len(known), len(remaining))
+    return parallel.pack(known), parallel.pack(remaining), counts
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Split strings into known dictionary words and leftovers.",
@@ -131,6 +177,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-sort", action="store_true",
         help="Leave output in input order instead of sorting and deduplicating.",
     )
+    parallel.add_jobs_arg(parser)
     cli.add_common_args(parser, force=False)
     return parser
 
@@ -148,6 +195,8 @@ def main() -> None:
     longest_word = max(map(len, vocabulary))
     starts = word_starts(vocabulary, args.min_word_length)
 
+    matcher = (vocabulary, args.min_word_length, longest_word, starts)
+
     lines = split_count = word_count = remainder_count = 0
     try:
         known_file = cli.create_text_file(args.known_out)
@@ -156,29 +205,37 @@ def main() -> None:
         cli.die(f"cannot open output file: {exc}")
 
     try:
-        with cli.open_input(args.input) as infile:
-            for line in cli.iter_lines(infile):
-                lines += 1
-                spans = split_into_words(
-                    line, vocabulary, args.min_word_length, longest_word, starts
-                )
-                if not spans:
-                    remaining_file.write(line + "\n")
-                    remainder_count += 1
-                    continue
-
-                split_count += 1
-                # Each stretch between words is its own leftover, so
-                # 'acme2026summer!' leaves '2026' and '!', not '2026!'.
-                position = 0
-                for start, end in [*spans, (len(line), len(line))]:
-                    if start > position:
-                        remaining_file.write(line[position:start] + "\n")
-                        remainder_count += 1
-                    if end > start:
-                        known_file.write(line[start:end] + "\n")
-                        word_count += 1
-                    position = end
+        jobs = parallel.resolve_jobs(args.jobs)
+        if jobs > 1:
+            results = parallel.ordered(
+                parallel.input_tasks(args.input), decompose_block, jobs=jobs,
+                initializer=start_worker, initargs=matcher,
+            )
+            write_known = known_file.buffer.write
+            write_remaining = remaining_file.buffer.write
+            for known, remaining, counts in results:
+                write_known(known)
+                write_remaining(remaining)
+                lines += counts[0]
+                split_count += counts[1]
+                word_count += counts[2]
+                remainder_count += counts[3]
+        else:
+            with cli.open_input(args.input) as infile:
+                source = cli.iter_lines(infile)
+                while True:
+                    batch = list(itertools.islice(source, cli.DEFAULT_CHUNK_SIZE))
+                    if not batch:
+                        break
+                    known, remaining, split = decompose(batch, *matcher)
+                    lines += len(batch)
+                    split_count += split
+                    word_count += len(known)
+                    remainder_count += len(remaining)
+                    if known:
+                        known_file.write("\n".join(known) + "\n")
+                    if remaining:
+                        remaining_file.write("\n".join(remaining) + "\n")
     finally:
         known_file.close()
         remaining_file.close()

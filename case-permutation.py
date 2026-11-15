@@ -24,7 +24,7 @@ for _candidate in (_here, _here.parent):
         sys.path.insert(0, str(_candidate))
         break
 
-from wordlistlib import caseperm, cli, estimate  # noqa: E402
+from wordlistlib import caseperm, cli, estimate, parallel  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -81,6 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N", help="Safety limit before --force is required "
                           f"(default {estimate.DEFAULT_MAX_CANDIDATES:,}).",
     )
+    parallel.add_jobs_arg(parser)
     cli.add_common_args(parser)
     cli.add_output_args(parser)
     return parser
@@ -237,26 +238,22 @@ def main() -> None:
 
     try_compiled_binary(args)         # replaces this process when it applies
 
-    words = word_source(args)
+    from_file = args.word is None and args.input not in (None, "-")
+    jobs = parallel.effective_jobs(
+        args.jobs,
+        None if from_file else
+        "the words are read twice, so more than one process needs them in a "
+        "file given with -i",
+    )
+    worker_setup = (args.common, args.max_upper, *parallel.length_bounds(args))
 
-    # First pass: size the job, a block of words at a time so the arithmetic
-    # runs in C. Only one block is ever held, so memory does not grow with
-    # the input.
-    if args.common:
-        count = caseperm.count_common_forms
+    # First pass: size the job. Nothing is kept, so memory does not grow
+    # with the input.
+    if jobs > 1:
+        word_count, length_sum, total, largest = count_parallel(args, jobs, worker_setup)
     else:
-        def count(word):
-            return caseperm.count_permutations(word, args.max_upper)
-
-    total = word_count = length_sum = 0
-    source = words()
-    while True:
-        block = list(itertools.islice(source, cli.DEFAULT_CHUNK_SIZE))
-        if not block:
-            break
-        word_count += len(block)
-        length_sum += sum(map(len, block))
-        total += sum(map(count, block))
+        words = word_source(args)
+        word_count, length_sum, total, largest = count_serial(args, words)
     if not word_count:
         cli.die("input contained no words")
     avg_length = length_sum / word_count
@@ -269,23 +266,113 @@ def main() -> None:
         label="permutations",
     )
 
-    if args.common:
-        expand = caseperm.iter_common_forms
-    else:
-        def expand(word):
-            return caseperm.permutations(word, args.max_upper)
-
-    # chain + map: each word's candidates flow straight into the writer with
-    # no generator frame of our own in between.
-    candidates = itertools.chain.from_iterable(map(expand, words()))
+    # A worker has to finish a word's permutations before it can hand them
+    # back, so a word that expands to more than fits comfortably in memory
+    # is left to the serial path, which streams them.
+    record = avg_length + 1
+    if jobs > 1 and largest * record > parallel.MAX_LINE_RESULT_BYTES:
+        cli.warn(f"--jobs ignored: one word alone expands to {largest:,} "
+                 f"permutations; use --max-upper to bound it")
+        jobs = 1
+        words = word_source(args)
 
     with cli.open_output(args.output, compress=args.gzip) as out:
-        writer = cli.writer_for(out, args)
-        writer.feed(candidates)
-        writer.close()
+        if jobs > 1:
+            # Size the input blocks so that neither a typical block nor a
+            # block made entirely of the worst-case word is too large.
+            input_bytes = parallel.input_size(args.input) or int(length_sum + word_count)
+            size = parallel.block_bytes_for_expansion(input_bytes, int(total * record))
+            worst_case_words = max(1, int(parallel.MAX_LINE_RESULT_BYTES // (largest * record)))
+            size = max(1, min(size, int(worst_case_words * record)))
+            writer = parallel.block_writer_for(out, args)
+            parallel.drain(
+                parallel.ordered(
+                    parallel.input_tasks(args.input, size), expand_block, jobs=jobs,
+                    initializer=start_worker, initargs=worker_setup,
+                ),
+                writer,
+            )
+        else:
+            if args.common:
+                expand = caseperm.iter_common_forms
+            else:
+                def expand(word):
+                    return caseperm.permutations(word, args.max_upper)
+
+            # chain + map: each word's candidates flow straight into the
+            # writer with no generator frame of our own in between.
+            candidates = itertools.chain.from_iterable(map(expand, words()))
+            writer = cli.writer_for(out, args)
+            writer.feed(candidates)
+            writer.close()
 
     cli.log(f"Permutations: {writer.report()}"
             + (f" -> {args.output}" if args.output else ""))
+
+
+def count_words(words, common: bool, max_upper: int | None) -> tuple[int, int, int, int]:
+    """``(words, total length, permutations, most from one word)`` for a batch."""
+    if common:
+        counts = list(map(caseperm.count_common_forms, words))
+    else:
+        counts = [caseperm.count_permutations(word, max_upper) for word in words]
+    return len(words), sum(map(len, words)), sum(counts), max(counts, default=0)
+
+
+def count_serial(args, words) -> tuple[int, int, int, int]:
+    word_count = length_sum = total = largest = 0
+    source = words()
+    while True:
+        block = list(itertools.islice(source, cli.DEFAULT_CHUNK_SIZE))
+        if not block:
+            break
+        n, length, count, biggest = count_words(block, args.common, args.max_upper)
+        word_count += n
+        length_sum += length
+        total += count
+        largest = max(largest, biggest)
+    return word_count, length_sum, total, largest
+
+
+def count_parallel(args, jobs: int, worker_setup: tuple) -> tuple[int, int, int, int]:
+    word_count = length_sum = total = largest = 0
+    results = parallel.ordered(
+        parallel.input_tasks(args.input), count_block, jobs=jobs,
+        initializer=start_worker, initargs=worker_setup,
+    )
+    for n, length, count, biggest in results:
+        word_count += n
+        length_sum += length
+        total += count
+        largest = max(largest, biggest)
+    return word_count, length_sum, total, largest
+
+
+# Per-worker state for --jobs, set once in each worker by start_worker().
+_COMMON = False
+_MAX_UPPER: int | None = None
+_BOUNDS: tuple[int, int | None] = (0, None)
+
+
+def start_worker(common: bool, max_upper: int | None, min_length: int,
+                 max_length: int | None) -> None:
+    global _COMMON, _MAX_UPPER, _BOUNDS
+    _COMMON, _MAX_UPPER, _BOUNDS = common, max_upper, (min_length, max_length)
+
+
+def count_block(text: str) -> tuple[int, int, int, int]:
+    """Worker for the sizing pass."""
+    return count_words(parallel.lines(text), _COMMON, _MAX_UPPER)
+
+
+def expand_block(text: str) -> tuple[bytes, int, int]:
+    """Worker for the generating pass: every permutation of a block's words."""
+    words = parallel.lines(text)
+    if _COMMON:
+        groups = map(caseperm.iter_common_forms, words)
+    else:
+        groups = (caseperm.permutations(word, _MAX_UPPER) for word in words)
+    return parallel.pack_filtered(itertools.chain.from_iterable(groups), *_BOUNDS)
 
 
 if __name__ == "__main__":
